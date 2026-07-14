@@ -10,8 +10,36 @@ import numpy as np
 from scipy.integrate import solve_ivp
 import random
 
+def delta_fn(t, alpha, r, omega_0):
+    """Stable scalar/numpy Delta(t) definition."""
+    exp_term = np.exp(-r * omega_0 * t)
+    cos_term = np.cos(omega_0 * t)
+    sin_term = np.sin(omega_0 * t)
+
+    delta = 2 * alpha ** 2 * r ** 2 / (1 + r ** 2) * (
+        1 - exp_term * (cos_term - sin_term / r)
+    )
+    if np.isnan(delta) or np.isinf(delta):
+        return 0.0
+    return delta
+
+
+def gamma_fn(t, alpha, r, omega_0):
+    """Stable scalar/numpy gamma(t) definition."""
+    exp_term = np.exp(-r * omega_0 * t)
+    cos_term = np.cos(omega_0 * t)
+    sin_term = np.sin(omega_0 * t)
+
+    gamma = alpha ** 2 * omega_0 * r ** 2 / (1 + r ** 2) * (
+        1 - exp_term * cos_term - r * sin_term
+    )
+    if np.isnan(gamma) or np.isinf(gamma):
+        return 0.0
+    return gamma
+
+
 def compute_delta_gamma(t, alpha, r, omega0=1.0, kBT=10.0):
-    """Compute Delta(t) and gamma(t) using the legacy QNODE formulas.
+    """Compute Delta(t) and gamma(t) using the stabilized TCL formulas.
 
     Args:
         t: time tensor, shape [N]
@@ -26,21 +54,20 @@ def compute_delta_gamma(t, alpha, r, omega0=1.0, kBT=10.0):
     if not isinstance(t, torch.Tensor):
         t = torch.tensor(t, dtype=torch.float64)
     r2 = r ** 2
-
-    # QNODE.py gamma(t) definition
     exp_term = torch.exp(-r * omega0 * t)
     cos_term = torch.cos(omega0 * t)
     sin_term = torch.sin(omega0 * t)
+
     gamma = (alpha ** 2 * omega0 * r2 / (1 + r2)) * (
         1 - exp_term * cos_term - r * sin_term
     )
-
-    # QNODE.py Delta(t) definition
-    Delta = (2 * alpha ** 2 * r2 / (1 + r2)) * (
+    delta = (2 * alpha ** 2 * r2 / (1 + r2)) * (
         1 - exp_term * (cos_term - sin_term / r)
     )
+    delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
+    gamma = torch.nan_to_num(gamma, nan=0.0, posinf=0.0, neginf=0.0)
 
-    return Delta.float(), gamma.float()
+    return delta.float(), gamma.float()
 
 
 def bloch_rhs(t, y, alpha, r, omega0, M, kBT):
@@ -135,6 +162,10 @@ def generate_task_data(alpha, r, num_traj=200, T=10.0, dt=0.01,
     return {
         'alpha': alpha,
         'r': r,
+        'omega0': omega0,
+        'M': M,
+        'zeta': zeta,
+        'kBT': kBT,
         'bloch': torch.from_numpy(bloch_traj),
         'delta': torch.from_numpy(Delta_np[None, :].repeat(num_traj, axis=0).astype(np.float32)),
         'gamma': torch.from_numpy(Gamma_np[None, :].repeat(num_traj, axis=0).astype(np.float32)),

@@ -5,186 +5,240 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchdiffeq import odeint as odeint_orig
+from scipy.integrate import solve_ivp
 
-
-def interpolate_dY_batch(t, t_grid, dY_seq):
-    if dY_seq.numel() == 0:
-        return torch.zeros(dY_seq.shape[0], device=dY_seq.device)
-    if t <= t_grid[0]:
-        return dY_seq[:, 0]
-    if t >= t_grid[-1]:
-        return dY_seq[:, -1]
-
-    idx = torch.searchsorted(t_grid, t.detach().to(t_grid.device)).item() - 1
-    idx = max(0, min(int(idx), dY_seq.shape[1] - 2))
-    t0, t1 = t_grid[idx], t_grid[idx + 1]
-    coef = (t - t0) / (t1 - t0)
-    coef = coef.to(dY_seq.device)
-    return dY_seq[:, idx] * (1 - coef) + dY_seq[:, idx + 1] * coef
-
-
-class Encoder(nn.Module):
-    def __init__(self, input_dim=4, hidden_dim=64, latent_dim=64):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, latent_dim),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class LatentODEFunc(nn.Module):
-    def __init__(self, latent_dim=64):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim + 3, 128),
-            nn.Tanh(),
-            nn.Linear(128, 128),
-            nn.Tanh(),
-            nn.Linear(128, latent_dim),
-        )
-
-    def forward(self, t, h, dY, lam):
-        while dY.dim() < h.dim():
-            dY = dY.unsqueeze(-1)
-        if dY.shape[0] != h.shape[0]:
-            dY = dY.expand(h.shape[0], -1)
-        lam_exp = lam.unsqueeze(0).expand(h.shape[0], -1)
-        return self.net(torch.cat([h, dY, lam_exp], dim=-1))
-
-
-class Decoder(nn.Module):
-    def __init__(self, latent_dim=64, hidden_dim=64):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 5),
-        )
-
-    def forward(self, h):
-        return self.net(h)
+from data_gen import bloch_rhs, compute_delta_gamma
 
 
 class AQNodeBase(nn.Module):
-    """Base AQNode shared across tasks: encoder + ODE func + decoder."""
+    """Base AQNode with direct eta -> (alpha, r) decoding and physics-only rollout."""
 
-    def __init__(self, latent_dim=64, measurement_dim=50):
+    def __init__(
+        self,
+        latent_dim=64,
+        context_dim=8,
+        measurement_dim=50,
+        omega0=1.0,
+        measurement_strength=0.4,
+    ):
         super().__init__()
         self.latent_dim = latent_dim
+        self.context_dim = context_dim
         self.measurement_dim = measurement_dim
-        self.encoder = Encoder(3 + 2 + measurement_dim, 64, latent_dim)
-        self.ode_func = LatentODEFunc(latent_dim)
-        self.decoder = Decoder(latent_dim)
+        self.output_dim = 3
+        self.omega0 = omega0
+        self.measurement_strength = measurement_strength
+        self.alpha_min = 0.05
+        self.alpha_max = 1.0
+        self.r_min = 0.05
+        self.r_max = 1.0
 
-    def encode_initial(self, init_state, dY_seq, init_delta, init_gamma):
-        """Return augmented h0 = [latent_state | truncated_dY_seq]."""
-        batch_size = init_state.shape[0]
-        width = min(dY_seq.shape[-1], self.measurement_dim)
-        dY_feat = dY_seq[:, :width]
-        if width < self.measurement_dim:
-            pad = torch.zeros(
-                batch_size,
-                self.measurement_dim - width,
-                device=dY_seq.device,
+    def encode_initial(self, init_state, dY_seq):
+        """The clean physics-only model needs only the initial Bloch state."""
+        return init_state
+
+    def _compute_amplitude(self, alpha, r):
+        r_safe = torch.clamp(r, min=1e-6)
+        r2 = r_safe ** 2
+        return (alpha ** 2) * r2 / (1.0 + r2)
+
+    def _compute_tcl_generator_from_params(self, t_grid, alpha, r):
+        """Generate physically constrained Delta/gamma from task-level alpha and cutoff ratio r."""
+        t = t_grid.view(-1, 1)
+        alpha = alpha.view(1, -1)
+        r = r.view(1, -1)
+        r_safe = torch.clamp(r, min=1e-6)
+        amplitude = self._compute_amplitude(alpha, r_safe)
+
+        exp_term = torch.exp(-r_safe * self.omega0 * t)
+        cos_term = torch.cos(self.omega0 * t)
+        sin_term = torch.sin(self.omega0 * t)
+
+        gamma = amplitude * self.omega0 * (
+            1.0 - exp_term * cos_term - r_safe * sin_term
+        )
+        delta = 2.0 * amplitude * (
+            1.0 - exp_term * (cos_term - sin_term / r_safe)
+        )
+        return delta, gamma
+
+    def _decode_eta_to_task_params(self, eta):
+        """Treat eta itself as the task parameter body: eta = [raw_alpha, raw_r]."""
+        if eta.numel() != 2:
+            raise ValueError(f"eta must be 2D [raw_alpha, raw_r], got shape {tuple(eta.shape)}")
+        eta = eta.view(-1)
+        raw_alpha = eta[0]
+        raw_r = eta[1]
+        pred_alpha = self.alpha_min + (self.alpha_max - self.alpha_min) * torch.sigmoid(raw_alpha)
+        pred_r = self.r_min + (self.r_max - self.r_min) * torch.sigmoid(raw_r)
+        pred_A = self._compute_amplitude(pred_alpha, pred_r)
+        return {
+            "pred_A": pred_A,
+            "pred_alpha": pred_alpha,
+            "pred_r": pred_r,
+        }
+
+    def _project_to_bloch_ball(self, state):
+        """Project predicted Bloch vectors back to the physical unit ball."""
+        radius = torch.linalg.norm(state, dim=-1, keepdim=True)
+        return state / torch.clamp(radius, min=1.0)
+
+    def _integrate_tcl_bloch(self, init_state, delta_traj, gamma_traj, t_grid):
+        """Integrate the TCL Bloch equations using formula-derived Delta/gamma."""
+        bloch_states = [self._project_to_bloch_ball(init_state)]
+        half_measurement = self.measurement_strength / 2.0
+
+        for idx in range(1, t_grid.shape[0]):
+            dt = t_grid[idx] - t_grid[idx - 1]
+            prev = bloch_states[-1]
+            delta_prev = delta_traj[idx - 1]
+            gamma_prev = gamma_traj[idx - 1]
+
+            rhs_prev = torch.stack(
+                [
+                    -(delta_prev + half_measurement) * prev[:, 0] - self.omega0 * prev[:, 1],
+                    self.omega0 * prev[:, 0] - (delta_prev + half_measurement) * prev[:, 1],
+                    -2.0 * gamma_prev - 2.0 * delta_prev * prev[:, 2],
+                ],
+                dim=-1,
             )
-            dY_feat = torch.cat([dY_feat, pad], dim=-1)
+            proposal = prev + dt * rhs_prev
 
-        enc_in = torch.cat([init_state, init_delta, init_gamma, dY_feat], dim=-1)
-        latent_state = self.encoder(enc_in)
-        return torch.cat([latent_state, dY_feat], dim=-1)
+            delta_next = delta_traj[idx]
+            gamma_next = gamma_traj[idx]
+            rhs_next = torch.stack(
+                [
+                    -(delta_next + half_measurement) * proposal[:, 0] - self.omega0 * proposal[:, 1],
+                    self.omega0 * proposal[:, 0] - (delta_next + half_measurement) * proposal[:, 1],
+                    -2.0 * gamma_next - 2.0 * delta_next * proposal[:, 2],
+                ],
+                dim=-1,
+            )
+            next_state = prev + 0.5 * dt * (rhs_prev + rhs_next)
+            bloch_states.append(self._project_to_bloch_ball(next_state))
 
-    def forward(self, h0, t_grid, lam, return_h=False, method="dopri5"):
-        t_grid = t_grid.to(h0.device)
+        return torch.stack(bloch_states, dim=0)
 
-        def ode_func(t, h):
-            latent_state = h[:, : self.latent_dim]
-            meas_seq = h[:, self.latent_dim : self.latent_dim + self.measurement_dim]
-            dY_t = interpolate_dY_batch(t, t_grid, meas_seq).unsqueeze(-1)
-            latent_deriv = self.ode_func(t, latent_state, dY_t, lam)
-            return torch.cat([latent_deriv, torch.zeros_like(meas_seq)], dim=-1)
-
-        h_traj = odeint_orig(ode_func, h0, t_grid, method=method, atol=1e-6, rtol=1e-6)
-        pred = self.decoder(h_traj[:, :, : self.latent_dim])
-        return (pred, h_traj) if return_h else pred
+    def forward(
+        self,
+        init_state,
+        t_grid,
+        eta,
+        return_aux=False,
+    ):
+        t_grid = t_grid.to(init_state.device)
+        aux = self._decode_eta_to_task_params(eta)
+        pred_alpha = aux["pred_alpha"]
+        pred_r = aux["pred_r"]
+        base_delta, base_gamma = self._compute_tcl_generator_from_params(
+            t_grid,
+            pred_alpha.unsqueeze(0),
+            pred_r.unsqueeze(0),
+        )
+        batch_size = init_state.shape[0]
+        base_delta = base_delta.repeat(1, batch_size)
+        base_gamma = base_gamma.repeat(1, batch_size)
+        pred_delta = base_delta
+        pred_gamma = base_gamma
+        pred_bloch = self._integrate_tcl_bloch(init_state, pred_delta, pred_gamma, t_grid)
+        aux["pred_delta_traj"] = pred_delta
+        aux["pred_gamma_traj"] = pred_gamma
+        if return_aux:
+            return pred_bloch, aux
+        return pred_bloch
 
 
 class InnerAQNode(nn.Module):
-    """AQNode with inner-loop learnable lambda parameters (alpha, r)."""
+    """AQNode whose inner-loop variable eta is the task parameter body [raw_alpha, raw_r]."""
 
-    def __init__(self, latent_dim=64, lambda_dim=2, measurement_dim=50):
+    def __init__(
+        self,
+        latent_dim=64,
+        context_dim=8,
+        measurement_dim=50,
+        omega0=1.0,
+        measurement_strength=0.4,
+    ):
         super().__init__()
-        self.base = AQNodeBase(latent_dim, measurement_dim)
-        self.lambda_param = nn.Parameter(torch.tensor([0.5, 0.3]))
+        if context_dim != 2:
+            raise ValueError(f"context_dim must be 2 for eta=[raw_alpha, raw_r], got {context_dim}")
+        self.base = AQNodeBase(
+            latent_dim,
+            context_dim,
+            measurement_dim,
+            omega0=omega0,
+            measurement_strength=measurement_strength,
+        )
+        self.eta_init = nn.Parameter(torch.zeros(2))
+        self.support_initializer = nn.Sequential(
+            nn.Linear(8, 16),
+            nn.Tanh(),
+            nn.Linear(16, 2),
+        )
         self.latent_dim = latent_dim
-        self.lambda_dim = lambda_dim
+        self.context_dim = 2
 
     def clone(self):
-        clone = InnerAQNode(self.latent_dim, self.lambda_dim, self.base.measurement_dim)
-        clone.base.load_state_dict(self.base.state_dict())
-        clone.lambda_param.data.copy_(self.lambda_param.data)
+        clone = InnerAQNode(
+            self.latent_dim,
+            self.context_dim,
+            self.base.measurement_dim,
+            omega0=self.base.omega0,
+            measurement_strength=self.base.measurement_strength,
+        )
+        clone.load_state_dict(self.state_dict())
         return clone
 
-    def encode_initial(self, init_state, dY_seq, init_delta, init_gamma):
-        return self.base.encode_initial(init_state, dY_seq, init_delta, init_gamma)
+    def encode_initial(self, init_state, dY_seq):
+        return self.base.encode_initial(init_state, dY_seq)
 
-    def forward(self, h0, t_grid, lam=None, return_h=False, method="dopri5"):
-        if lam is None:
-            lam = self.lambda_param
-        return self.base.forward(h0, t_grid, lam, return_h, method)
+    def _summarize_support_batch(self, support_batch):
+        init_state = support_batch["init_state"]
+        dY = support_batch["dY"].squeeze(-1)
+        init_mean = init_state.mean(dim=0)
+        init_std = init_state.std(dim=0, unbiased=False)
+        dy_mean = dY.mean().unsqueeze(0)
+        dy_std = dY.std(unbiased=False).unsqueeze(0)
+        return torch.cat([init_mean, init_std, dy_mean, dy_std], dim=0)
+
+    def infer_eta_init_from_support(self, support_batch):
+        support_feat = self._summarize_support_batch(support_batch)
+        eta_bias = 0.1 * torch.tanh(self.support_initializer(support_feat))
+        return self.eta_init + eta_bias
+
+    def forward(
+        self,
+        init_state,
+        t_grid,
+        eta=None,
+        return_aux=False,
+    ):
+        if eta is None:
+            eta = self.eta_init
+        return self.base.forward(
+            init_state,
+            t_grid,
+            eta,
+            return_aux,
+        )
 
     def compute_loss(
         self,
         pred,
         bloch_target,
-        delta_target,
-        gamma_target,
+        w_x=1.0,
+        w_y=1.0,
         w_z=1.5,
-        w_delta=0.7,
-        w_gamma=1.2,
-        init_weight=0.1,
-        bloch_reg=0.0,
-        trend_weight=0.0,
     ):
-        """Weighted component loss aligned with train/eval settings."""
-        loss_x = torch.mean((pred[1:, :, 0] - bloch_target[1:, :, 0]) ** 2)
-        loss_y = torch.mean((pred[1:, :, 1] - bloch_target[1:, :, 1]) ** 2)
-        loss_z = torch.mean((pred[1:, :, 2] - bloch_target[1:, :, 2]) ** 2)
-        loss_d = torch.mean((pred[1:, :, 3] - delta_target[1:]) ** 2)
-        loss_g = torch.mean((pred[1:, :, 4] - gamma_target[1:]) ** 2)
-
-        loss_init = init_weight * torch.mean(
-            (pred[0:1, :, :3] - bloch_target[0:1, :, :3]) ** 2
-        )
-
-        loss_reg = 0.0
-        if bloch_reg > 0:
-            radius = torch.linalg.norm(pred[:, :, :3], dim=-1)
-            loss_reg = bloch_reg * torch.mean(torch.relu(radius - 1.0) ** 2)
-
-        loss_trend = 0.0
-        if trend_weight > 0 and pred.shape[0] > 1:
-            pred_diff = pred[1:, :, :3] - pred[:-1, :, :3]
-            target_diff = bloch_target[1:, :, :3] - bloch_target[:-1, :, :3]
-            loss_trend = trend_weight * torch.mean((pred_diff - target_diff) ** 2)
+        """Weighted reconstruction loss on the Bloch vector [x, y, z]."""
+        loss_x = torch.mean((pred[:, :, 0] - bloch_target[:, :, 0]) ** 2)
+        loss_y = torch.mean((pred[:, :, 1] - bloch_target[:, :, 1]) ** 2)
+        loss_z = torch.mean((pred[:, :, 2] - bloch_target[:, :, 2]) ** 2)
 
         return (
-            loss_x
-            + loss_y
+            w_x * loss_x
+            + w_y * loss_y
             + w_z * loss_z
-            + w_delta * loss_d
-            + w_gamma * loss_g
-            + loss_init
-            + loss_reg
-            + loss_trend
         )
 
 
@@ -199,37 +253,49 @@ class MetaTrainer:
         weight_decay=1e-5,
         seq_len=100,
         batch_size=20,
-        perturb_scale=0.05,
+        w_x=1.0,
+        w_y=1.0,
         w_z=1.5,
-        w_gamma=1.2,
-        bloch_reg=0.01,
+        w_alpha=1.0,
+        w_r=1.0,
+        w_dy=0.0,
         inner_steps=5,
         inner_lr=0.1,
-        lambda_meta_lr=0.2,
-        lambda_supervision_weight=1.0,
-        trend_weight=0.5,
+        context_dim=8,
+        eta_reg_weight=1e-3,
         device="cuda:0",
-        init_weight=0.1,
         measurement_dim=None,
+        resimulate_query=True,
+        omega0=1.0,
+        measurement_strength=0.4,
+        w_a=None,
     ):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.task_dataset = task_dataset
         self.seq_len = seq_len
         self.batch_size = batch_size
-        self.perturb_scale = perturb_scale
         self.inner_steps = inner_steps
         self.inner_lr = inner_lr
-        self.lambda_meta_lr = lambda_meta_lr
-        self.lambda_supervision_weight = lambda_supervision_weight
-        self.trend_weight = trend_weight
-        self.init_weight = init_weight
+        self.context_dim = context_dim
+        self.eta_reg_weight = eta_reg_weight
+        self.w_x = w_x
+        self.w_y = w_y
         self.w_z = w_z
-        self.w_delta = 0.7
-        self.w_gamma = w_gamma
-        self.bloch_reg = bloch_reg
+        self.w_alpha = w_alpha if w_a is None else w_a
+        self.w_r = w_r
+        self.w_dy = w_dy
         self.measurement_dim = measurement_dim if measurement_dim is not None else seq_len
+        self.resimulate_query = resimulate_query
+        self.omega0 = omega0
+        self.measurement_strength = measurement_strength
 
-        self.meta_net = InnerAQNode(latent_dim, measurement_dim=self.measurement_dim).to(self.device)
+        self.meta_net = InnerAQNode(
+            latent_dim,
+            context_dim=context_dim,
+            measurement_dim=self.measurement_dim,
+            omega0=omega0,
+            measurement_strength=measurement_strength,
+        ).to(self.device)
         self.best_net = copy.deepcopy(self.meta_net)
         self.lowest_loss = float("inf")
 
@@ -241,34 +307,60 @@ class MetaTrainer:
         self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=500, gamma=0.5)
         self.metrics_his = []
         self.val_metrics_his = []
+        self.selection_score_his = []
+        self.train_recon_his = []
+        self.train_param_his = []
+        self.train_eta_shift_his = []
+        self.train_eta_norm_his = []
+        self.val_recon_his = []
+        self.val_param_his = []
 
     def _compute_recon_loss(self, model, pred, batch):
         return model.compute_loss(
             pred,
             batch["bloch"],
-            batch["delta"],
-            batch["gamma"],
+            w_x=self.w_x,
+            w_y=self.w_y,
             w_z=self.w_z,
-            w_delta=self.w_delta,
-            w_gamma=self.w_gamma,
-            init_weight=self.init_weight,
-            bloch_reg=self.bloch_reg,
-            trend_weight=self.trend_weight,
         )
 
-    def _compute_lambda_loss(self, lam, batch):
-        target_lambda = batch["task_lambda"]
-        return torch.mean((lam - target_lambda) ** 2)
+    def _compute_eta_reg(self, eta, eta_ref=None):
+        if eta_ref is None:
+            eta_ref = self.meta_net.eta_init
+        return torch.mean((eta - eta_ref) ** 2)
 
-    def _compute_total_loss(self, model, pred, batch, lam=None, include_lambda_supervision=False):
+    def _compute_total_loss(
+        self,
+        model,
+        pred,
+        batch,
+        eta=None,
+        eta_ref=None,
+        include_eta_reg=False,
+        aux=None,
+        include_param_loss=True,
+    ):
         recon_loss = self._compute_recon_loss(model, pred, batch)
-        lambda_loss = torch.tensor(0.0, device=self.device)
-        if include_lambda_supervision and lam is not None and self.lambda_supervision_weight > 0:
-            lambda_loss = self.lambda_supervision_weight * self._compute_lambda_loss(lam, batch)
-        total_loss = recon_loss + lambda_loss
-        return total_loss, recon_loss.detach(), lambda_loss.detach()
+        dy_loss = torch.tensor(0.0, device=self.device)
+        eta_reg = torch.tensor(0.0, device=self.device)
+        param_loss = torch.tensor(0.0, device=self.device)
+        if self.w_dy > 0:
+            scale = torch.sqrt(batch["task_M"] * batch["task_zeta"])
+            dy_hat = scale * pred[:, :, 2]
+            dy_true = batch["dY"].squeeze(-1)
+            dy_loss = self.w_dy * torch.mean((dy_hat - dy_true) ** 2)
+        if aux is not None:
+            if include_param_loss:
+                if self.w_alpha > 0:
+                    param_loss = param_loss + self.w_alpha * (aux["pred_alpha"] - batch["task_alpha"]) ** 2
+                if self.w_r > 0:
+                    param_loss = param_loss + self.w_r * (aux["pred_r"] - batch["task_r"]) ** 2
+        if include_eta_reg and eta is not None and self.eta_reg_weight > 0:
+            eta_reg = self.eta_reg_weight * self._compute_eta_reg(eta, eta_ref=eta_ref)
+        total_loss = recon_loss + dy_loss + param_loss + eta_reg
+        return total_loss, recon_loss.detach(), param_loss.detach(), eta_reg.detach()
 
-    def _build_batch(self, task_data, traj_idx, t_start=0, seq_len=None, apply_perturb=True):
+    def _build_batch(self, task_data, traj_idx, t_start=0, seq_len=None):
         traj_idx = np.asarray(traj_idx, dtype=np.int64)
         num_time = task_data["bloch"].shape[1]
         seq_len = num_time if seq_len is None else min(seq_len, num_time)
@@ -281,20 +373,7 @@ class MetaTrainer:
         dY = task_data["dY"][traj_idx, sl].to(self.device).unsqueeze(-1).permute(1, 0, 2)
         t_grid = task_data["t"][sl].to(self.device)
 
-        actual_batch = len(traj_idx)
         init_state = bloch[0].clone()
-        width = min(self.measurement_dim, dY.shape[0])
-        dY_seq_flat = dY[:width].permute(1, 0, 2).reshape(actual_batch, -1)
-        if width < self.measurement_dim:
-            pad = torch.zeros(actual_batch, self.measurement_dim - width, device=dY.device)
-            dY_seq_flat = torch.cat([dY_seq_flat, pad], dim=-1)
-
-        init_delta = delta[0].clone().unsqueeze(-1)
-        init_gamma = gamma[0].clone().unsqueeze(-1)
-        if apply_perturb and self.perturb_scale > 0:
-            init_state += torch.randn_like(init_state) * self.perturb_scale
-            init_delta += torch.randn_like(init_delta) * self.perturb_scale * 0.3
-            init_gamma += torch.randn_like(init_gamma) * self.perturb_scale * 0.3
 
         return {
             "t_grid": t_grid,
@@ -302,20 +381,16 @@ class MetaTrainer:
             "bloch": bloch,
             "delta": delta,
             "gamma": gamma,
-            "task_lambda": torch.tensor(
-                [task_data["alpha"], task_data["r"]],
-                dtype=torch.float32,
-                device=self.device,
-            ),
             "init_state": init_state,
-            "dY_seq_flat": dY_seq_flat,
-            "init_delta": init_delta,
-            "init_gamma": init_gamma,
+            "task_alpha": torch.tensor(float(task_data["alpha"]), device=self.device),
+            "task_r": torch.tensor(float(task_data["r"]), device=self.device),
+            "task_M": torch.tensor(float(task_data.get("M", 0.4)), device=self.device),
+            "task_zeta": torch.tensor(float(task_data.get("zeta", 0.9)), device=self.device),
             "traj_idx": traj_idx,
             "t_start": t_start,
         }
 
-    def sample_task_data(self, task_data, seq_len=None, apply_perturb=True):
+    def sample_task_data(self, task_data, seq_len=None):
         num_traj = task_data["bloch"].shape[0]
         num_time = task_data["bloch"].shape[1]
         batch_size = min(self.batch_size, num_traj)
@@ -330,18 +405,74 @@ class MetaTrainer:
             traj_idx=traj_idx,
             t_start=t_start,
             seq_len=seq_len,
-            apply_perturb=apply_perturb,
         )
 
+    def _resimulate_batch_from_init(self, task_data, batch):
+        """Regenerate batch ground truth from the current batch initial states."""
+        t_grid = batch["t_grid"] - batch["t_grid"][0]
+        t_np = t_grid.detach().cpu().numpy().astype(np.float64)
+        num_steps = len(t_np)
+        batch_size = batch["init_state"].shape[0]
+
+        alpha = float(task_data["alpha"])
+        r = float(task_data["r"])
+        omega0 = float(task_data.get("omega0", 1.0))
+        M = float(task_data.get("M", 0.4))
+        zeta = float(task_data.get("zeta", 0.9))
+        kBT = float(task_data.get("kBT", 10.0))
+
+        bloch = np.zeros((num_steps, batch_size, 3), dtype=np.float32)
+        dY = np.zeros((num_steps, batch_size, 1), dtype=np.float32)
+
+        init_state_np = batch["init_state"].detach().cpu().numpy()
+        for idx in range(batch_size):
+            y0 = init_state_np[idx].astype(np.float64).tolist()
+            sol = solve_ivp(
+                bloch_rhs,
+                [float(t_np[0]), float(t_np[-1])],
+                y0,
+                t_eval=t_np,
+                args=(alpha, r, omega0, M, kBT),
+                method="RK45",
+                rtol=1e-8,
+                atol=1e-10,
+            )
+            traj = sol.y.T.astype(np.float32)
+            bloch[:, idx, :] = traj
+            dY[:, idx, 0] = np.sqrt(M * zeta) * traj[:, 2]
+
+        delta_t, gamma_t = compute_delta_gamma(
+            torch.from_numpy(t_np),
+            alpha,
+            r,
+            omega0=omega0,
+            kBT=kBT,
+        )
+        delta = delta_t.float().unsqueeze(1).repeat(1, batch_size).to(self.device)
+        gamma = gamma_t.float().unsqueeze(1).repeat(1, batch_size).to(self.device)
+        dY_tensor = torch.from_numpy(dY).to(self.device)
+
+        batch["t_grid"] = t_grid
+        batch["bloch"] = torch.from_numpy(bloch).to(self.device)
+        batch["delta"] = delta
+        batch["gamma"] = gamma
+        batch["dY"] = dY_tensor
+        batch["task_M"] = torch.tensor(float(M), device=self.device)
+        batch["task_zeta"] = torch.tensor(float(zeta), device=self.device)
+        return batch
+
     def _sample_support_query(self, task_data):
-        support = self.sample_task_data(task_data, apply_perturb=True)
-        query = self.sample_task_data(task_data, apply_perturb=True)
+        support = self.sample_task_data(task_data)
+        query = self.sample_task_data(task_data)
         for _ in range(3):
             same_traj = np.array_equal(support["traj_idx"], query["traj_idx"])
             same_window = support["t_start"] == query["t_start"]
             if not (same_traj and same_window):
                 break
-            query = self.sample_task_data(task_data, apply_perturb=True)
+            query = self.sample_task_data(task_data)
+        if self.resimulate_query:
+            support = self._resimulate_batch_from_init(task_data, support)
+            query = self._resimulate_batch_from_init(task_data, query)
         return support, query
 
     def _deterministic_support_query(self, task_data, seq_len=None):
@@ -361,56 +492,58 @@ class MetaTrainer:
             traj_idx=support_idx,
             t_start=0,
             seq_len=seq_len,
-            apply_perturb=False,
         )
         query = self._build_batch(
             task_data,
             traj_idx=query_idx,
             t_start=0,
             seq_len=seq_len,
-            apply_perturb=False,
         )
+        if self.resimulate_query:
+            support = self._resimulate_batch_from_init(task_data, support)
+            query = self._resimulate_batch_from_init(task_data, query)
         return support, query
 
-    def _adapt_lambda(self, support_batch):
-        h0 = self.meta_net.encode_initial(
+    def _adapt_eta(self, support_batch):
+        init_state_inner = self.meta_net.encode_initial(
             support_batch["init_state"],
-            support_batch["dY_seq_flat"],
-            support_batch["init_delta"],
-            support_batch["init_gamma"],
+            None,
+        ).detach()
+
+        eta0_task = self.meta_net.infer_eta_init_from_support(support_batch)
+        adapted_eta = eta0_task
+        _, aux_init = self.meta_net(
+            init_state_inner,
+            support_batch["t_grid"],
+            eta=adapted_eta,
+            return_aux=True,
         )
-        h0_inner = h0.detach()
 
-        adapted_lambda = nn.Parameter(self.meta_net.lambda_param.detach().clone().to(self.device))
-        inner_optim = optim.SGD([adapted_lambda], lr=self.inner_lr)
-
-        for _ in range(self.inner_steps):
-            pred = self.meta_net(h0_inner, support_batch["t_grid"], lam=adapted_lambda)
-            loss, _, _ = self._compute_total_loss(
+        for step_idx in range(self.inner_steps):
+            pred, aux = self.meta_net(
+                init_state_inner,
+                support_batch["t_grid"],
+                eta=adapted_eta,
+                return_aux=True,
+            )
+            loss, _, _, _ = self._compute_total_loss(
                 self.meta_net,
                 pred,
                 support_batch,
-                lam=adapted_lambda,
-                include_lambda_supervision=True,
+                eta=adapted_eta,
+                eta_ref=eta0_task,
+                include_eta_reg=True,
+                aux=aux,
+                include_param_loss=False,
             )
-            inner_optim.zero_grad()
-            loss.backward()
-            inner_optim.step()
+            eta_grad = torch.autograd.grad(loss, adapted_eta, retain_graph=False, create_graph=False)[0]
+            adapted_eta = adapted_eta - self.inner_lr * eta_grad
 
-        return adapted_lambda.detach()
+        return adapted_eta, eta0_task
 
     def _clear_inner_loop_grads(self):
-        self.meta_net.base.encoder.zero_grad()
-        self.meta_net.base.ode_func.zero_grad()
-        self.meta_net.base.decoder.zero_grad()
-        self.meta_net.lambda_param.grad = None
-
-    def _meta_update_lambda_init(self, adapted_lambda):
-        with torch.no_grad():
-            self.meta_net.lambda_param.data.lerp_(
-                adapted_lambda.to(self.meta_net.lambda_param.device),
-                self.lambda_meta_lr,
-            )
+        self.meta_net.base.zero_grad()
+        self.meta_net.eta_init.grad = None
 
     def meta_update(self, task_data):
         """Single FOMAML update with separate support/query batches."""
@@ -418,128 +551,180 @@ class MetaTrainer:
         self.meta_net.train()
         self.optimizer.zero_grad()
 
-        lambda_before = self.meta_net.lambda_param.detach().clone()
-        adapted_lambda = self._adapt_lambda(support_batch)
-        self._clear_inner_loop_grads()
+        adapted_eta, eta0_task = self._adapt_eta(support_batch)
 
-        h0_query = self.meta_net.encode_initial(
+        init_state_query = self.meta_net.encode_initial(
             query_batch["init_state"],
-            query_batch["dY_seq_flat"],
-            query_batch["init_delta"],
-            query_batch["init_gamma"],
+            None,
         )
-        pred_query = self.meta_net(h0_query, query_batch["t_grid"], lam=adapted_lambda)
-        meta_loss, recon_loss, lambda_loss = self._compute_total_loss(
+        pred_query, query_aux = self.meta_net(
+            init_state_query,
+            query_batch["t_grid"],
+            eta=adapted_eta,
+            return_aux=True,
+        )
+        meta_loss, recon_loss, param_loss, eta_reg = self._compute_total_loss(
             self.meta_net,
             pred_query,
             query_batch,
-            lam=adapted_lambda,
-            include_lambda_supervision=True,
+            eta=adapted_eta,
+            eta_ref=eta0_task,
+            include_eta_reg=True,
+            aux=query_aux,
         )
 
         meta_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.meta_net.parameters(), max_norm=5.0)
         self.optimizer.step()
-        self._meta_update_lambda_init(adapted_lambda)
-
-        lambda_after = self.meta_net.lambda_param.detach().clone().cpu().numpy()
-        lam_shift = float(torch.norm(adapted_lambda.cpu() - lambda_before.cpu()).item())
+        eta_after = self.meta_net.eta_init.detach().clone().cpu().numpy()
+        eta_shift = float(torch.norm(adapted_eta.detach().cpu() - eta0_task.detach().cpu()).item())
 
         return {
             "loss": meta_loss.item(),
             "recon_loss": float(recon_loss.item()),
-            "lambda_loss": float(lambda_loss.item()),
-            "adapted_lam": adapted_lambda.cpu().numpy(),
-            "meta_lam": lambda_after,
-            "lam_shift": lam_shift,
+            "param_loss": float(param_loss.item()),
+            "eta_reg": float(eta_reg.item()),
+            "adapted_eta": adapted_eta.detach().cpu().numpy(),
+            "eta0_task": eta0_task.detach().cpu().numpy(),
+            "meta_eta": eta_after,
+            "eta_shift": eta_shift,
         }
 
     def _evaluate_batches(self, support_batch, query_batch):
         self.meta_net.eval()
-        adapted_lambda = self._adapt_lambda(support_batch)
-        self._clear_inner_loop_grads()
+        adapted_eta, eta0_task = self._adapt_eta(support_batch)
 
         with torch.no_grad():
-            h0_query = self.meta_net.encode_initial(
+            init_state_query = self.meta_net.encode_initial(
                 query_batch["init_state"],
-                query_batch["dY_seq_flat"],
-                query_batch["init_delta"],
-                query_batch["init_gamma"],
+                None,
             )
-            pred = self.meta_net(h0_query, query_batch["t_grid"], lam=adapted_lambda)
-            total_loss, recon_loss, lambda_loss = self._compute_total_loss(
+            pred, query_aux = self.meta_net(
+                init_state_query,
+                query_batch["t_grid"],
+                eta=adapted_eta,
+                return_aux=True,
+            )
+            total_loss, recon_loss, param_loss, eta_reg = self._compute_total_loss(
                 self.meta_net,
                 pred,
                 query_batch,
-                lam=adapted_lambda,
-                include_lambda_supervision=True,
+                eta=adapted_eta,
+                eta_ref=eta0_task,
+                include_eta_reg=True,
+                aux=query_aux,
             )
             bloch_mse = torch.mean((pred[:, :, :3] - query_batch["bloch"]) ** 2)
+            mse_x = torch.mean((pred[:, :, 0] - query_batch["bloch"][:, :, 0]) ** 2)
+            mse_y = torch.mean((pred[:, :, 1] - query_batch["bloch"][:, :, 1]) ** 2)
+            mse_z = torch.mean((pred[:, :, 2] - query_batch["bloch"][:, :, 2]) ** 2)
+            pred_delta = query_aux["pred_delta_traj"]
+            pred_gamma = query_aux["pred_gamma_traj"]
+            mse_delta = torch.mean((pred_delta - query_batch["delta"]) ** 2)
+            mse_gamma = torch.mean((pred_gamma - query_batch["gamma"]) ** 2)
+            err_alpha = torch.abs(query_aux["pred_alpha"] - query_batch["task_alpha"])
+            err_r = torch.abs(query_aux["pred_r"] - query_batch["task_r"])
 
         self.meta_net.train()
         return {
             "loss": float(total_loss.item()),
             "recon_loss": float(recon_loss.item()),
-            "lambda_loss": float(lambda_loss.item()),
+            "param_loss": float(param_loss.item()),
+            "eta_reg": float(eta_reg.item()),
             "bloch_mse": float(bloch_mse.item()),
+            "mse_x": float(mse_x.item()),
+            "mse_y": float(mse_y.item()),
+            "mse_z": float(mse_z.item()),
+            "mse_delta": float(mse_delta.item()),
+            "mse_gamma": float(mse_gamma.item()),
+            "pred_A": float(query_aux["pred_A"].item()),
+            "pred_alpha": float(query_aux["pred_alpha"].item()),
+            "pred_r": float(query_aux["pred_r"].item()),
+            "err_alpha": float(err_alpha.item()),
+            "err_r": float(err_r.item()),
             "pred": pred,
+            "pred_delta": pred_delta,
+            "pred_gamma": pred_gamma,
             "batch": query_batch,
-            "lam": adapted_lambda.cpu().numpy(),
+            "eta": adapted_eta.detach().cpu().numpy(),
+            "eta0_task": eta0_task.detach().cpu().numpy(),
         }
 
     def train(self, num_epochs=200, tasks_per_epoch=5, val_tasks=None):
-        ids = list(self.task_dataset.keys())
+        ids = sorted(self.task_dataset.keys())
         for ep in range(num_epochs):
-            chosen = np.random.choice(ids, min(tasks_per_epoch, len(ids)), replace=False)
+            chosen = ids
             ep_loss = 0.0
-            all_adapted_lam = []
-            all_meta_lam = []
-            all_lam_shift = []
+            ep_recon = 0.0
+            ep_param = 0.0
+            all_eta_shift = []
+            all_eta_norm = []
             for tid in chosen:
                 update_info = self.meta_update(self.task_dataset[tid])
                 ep_loss += update_info["loss"]
-                all_adapted_lam.append(update_info["adapted_lam"])
-                all_meta_lam.append(update_info["meta_lam"])
-                all_lam_shift.append(update_info["lam_shift"])
+                ep_recon += update_info["recon_loss"]
+                ep_param += update_info["param_loss"]
+                all_eta_shift.append(update_info["eta_shift"])
+                all_eta_norm.append(float(np.linalg.norm(update_info["adapted_eta"])))
                 print(
                     f"Ep {ep:3d} T{tid}: query_loss={update_info['loss']:.6f} "
                     f"recon={update_info['recon_loss']:.6f} "
-                    f"lam_loss={update_info['lambda_loss']:.6f} "
-                    f"adapted_lam=[{update_info['adapted_lam'][0]:.4f} {update_info['adapted_lam'][1]:.4f}] "
-                    f"meta_lam=[{update_info['meta_lam'][0]:.4f} {update_info['meta_lam'][1]:.4f}] "
-                    f"lam_shift={update_info['lam_shift']:.5f}"
+                    f"param={update_info['param_loss']:.6f} "
+                    f"eta_reg={update_info['eta_reg']:.6f} "
+                    f"|adapted_eta|={np.linalg.norm(update_info['adapted_eta']):.4f} "
+                    f"|meta_eta|={np.linalg.norm(update_info['meta_eta']):.4f} "
+                    f"eta_shift={update_info['eta_shift']:.5f}"
                 )
 
             avg = ep_loss / len(chosen)
+            avg_recon = ep_recon / len(chosen)
+            avg_param = ep_param / len(chosen)
             self.metrics_his.append(avg)
+            self.train_recon_his.append(avg_recon)
+            self.train_param_his.append(avg_param)
             self.scheduler.step()
 
             val_avg = None
+            selection_score = None
             if val_tasks is not None:
                 val_loss = 0.0
+                val_recon = 0.0
+                val_param = 0.0
                 for _, task_data in val_tasks.items():
                     self.meta_net.load_state_dict(self.meta_net.state_dict())
                     support_batch, query_batch = self._deterministic_support_query(task_data)
                     metrics = self._evaluate_batches(support_batch, query_batch)
                     val_loss += metrics["loss"]
+                    val_recon += metrics["recon_loss"]
+                    val_param += metrics["param_loss"]
 
                 val_avg = val_loss / len(val_tasks)
+                val_recon_avg = val_recon / len(val_tasks)
+                val_param_avg = val_param / len(val_tasks)
+                # Select checkpoints by parameter identification first, with reconstruction as a tie-breaker.
+                selection_score = val_param_avg + 0.1 * val_recon_avg
                 self.val_metrics_his.append(val_avg)
-                if val_avg < self.lowest_loss:
+                self.val_recon_his.append(val_recon_avg)
+                self.val_param_his.append(val_param_avg)
+                self.selection_score_his.append(selection_score)
+                if selection_score < self.lowest_loss:
                     self.best_net = copy.deepcopy(self.meta_net)
-                    self.lowest_loss = val_avg
+                    self.lowest_loss = selection_score
             else:
                 if avg < self.lowest_loss:
                     self.best_net = copy.deepcopy(self.meta_net)
                     self.lowest_loss = avg
 
             val_str = f"  val={val_avg:.6f}" if val_avg is not None else ""
-            lam_shift_avg = float(np.mean(all_lam_shift)) if all_lam_shift else 0.0
-            meta_lam_mean = np.mean(all_meta_lam, axis=0) if all_meta_lam else self.meta_net.lambda_param.detach().cpu().numpy()
+            select_str = f"  sel={selection_score:.6f}" if selection_score is not None else ""
+            eta_shift_avg = float(np.mean(all_eta_shift)) if all_eta_shift else 0.0
+            eta_norm_avg = float(np.mean(all_eta_norm)) if all_eta_norm else float(torch.norm(self.meta_net.eta_init).item())
+            self.train_eta_shift_his.append(eta_shift_avg)
+            self.train_eta_norm_his.append(eta_norm_avg)
             print(
-                f"  Avg query loss: {avg:.6f}{val_str}  "
-                f"mean_meta_lam=[{meta_lam_mean[0]:.4f} {meta_lam_mean[1]:.4f}]  "
-                f"mean_lam_shift={lam_shift_avg:.5f}"
+                f"  Avg query loss: {avg:.6f}{val_str}{select_str}  "
+                f"mean_eta_norm={eta_norm_avg:.4f}  "
+                f"mean_eta_shift={eta_shift_avg:.5f}"
             )
 
     def evaluate(self, task_data):
@@ -561,31 +746,40 @@ class MetaTrainer:
             traj_idx=support_idx,
             t_start=0,
             seq_len=min(self.seq_len, task_data["bloch"].shape[1]),
-            apply_perturb=False,
         )
         query_batch = self._build_batch(
             task_data,
             traj_idx=np.asarray([traj_idx]),
             t_start=0,
             seq_len=task_data["bloch"].shape[1],
-            apply_perturb=False,
         )
+        if self.resimulate_query:
+            support_batch = self._resimulate_batch_from_init(task_data, support_batch)
+            query_batch = self._resimulate_batch_from_init(task_data, query_batch)
         metrics = self._evaluate_batches(support_batch, query_batch)
         pred_full = metrics["pred"][:, 0, :].detach().cpu().numpy()
         true_traj = query_batch["bloch"][:, 0, :3].detach().cpu().numpy()
         true_delta = query_batch["delta"][:, 0].detach().cpu().numpy()
         true_gamma = query_batch["gamma"][:, 0].detach().cpu().numpy()
-        pred_traj = pred_full[:, :3].copy()
-        pred_traj[0] = true_traj[0]
-        pred_delta = pred_full[:, 3].copy()
-        pred_gamma = pred_full[:, 4].copy()
-        pred_delta[0] = true_delta[0]
-        pred_gamma[0] = true_gamma[0]
+        pred_traj = pred_full.copy()
+        pred_delta = metrics["pred_delta"][:, 0].detach().cpu().numpy()
+        pred_gamma = metrics["pred_gamma"][:, 0].detach().cpu().numpy()
 
         return {
             "loss": metrics["loss"],
             "bloch_mse": metrics["bloch_mse"],
-            "lam": metrics["lam"],
+            "mse_x": metrics["mse_x"],
+            "mse_y": metrics["mse_y"],
+            "mse_z": metrics["mse_z"],
+            "mse_delta": metrics["mse_delta"],
+            "mse_gamma": metrics["mse_gamma"],
+            "param_loss": metrics["param_loss"],
+            "pred_A": metrics["pred_A"],
+            "pred_alpha": metrics["pred_alpha"],
+            "pred_r": metrics["pred_r"],
+            "err_alpha": metrics["err_alpha"],
+            "err_r": metrics["err_r"],
+            "eta": metrics["eta"],
             "true_traj": true_traj,
             "pred_traj": pred_traj,
             "true_delta": true_delta,
@@ -601,8 +795,27 @@ class MetaTrainer:
             results[tid] = {
                 "loss": metrics["loss"],
                 "bloch_mse": metrics["bloch_mse"],
+                "mse_x": metrics["mse_x"],
+                "mse_y": metrics["mse_y"],
+                "mse_z": metrics["mse_z"],
+                "mse_delta": metrics["mse_delta"],
+                "mse_gamma": metrics["mse_gamma"],
+                "param_loss": metrics["param_loss"],
+                "A": float(self.meta_net.base._compute_amplitude(
+                    torch.tensor(float(task_data["alpha"])),
+                    torch.tensor(float(task_data["r"])),
+                ).item()),
                 "alpha": task_data["alpha"],
                 "r": task_data["r"],
-                "lam": metrics["lam"],
+                "pred_A": metrics["pred_A"],
+                "pred_alpha": metrics["pred_alpha"],
+                "pred_r": metrics["pred_r"],
+                "err_A": abs(metrics["pred_A"] - float(self.meta_net.base._compute_amplitude(
+                    torch.tensor(float(task_data["alpha"])),
+                    torch.tensor(float(task_data["r"])),
+                ).item())),
+                "err_alpha": metrics["err_alpha"],
+                "err_r": metrics["err_r"],
+                "eta": metrics["eta"],
             }
         return results

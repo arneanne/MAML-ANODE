@@ -1,4 +1,5 @@
 # visualization.py - Bloch sphere and training visualization
+import json
 import os, numpy as np, matplotlib, torch, matplotlib.lines as mlines
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
@@ -131,6 +132,173 @@ def plot_component_panels(
     plt.close()
 
 
+def plot_training_diagnostics(trainer, save_dir):
+    epochs = np.arange(len(trainer.metrics_his))
+    if len(epochs) == 0:
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 7))
+    axes = axes.ravel()
+
+    axes[0].plot(epochs, trainer.metrics_his, lw=2.0, label='Train total')
+    if trainer.val_metrics_his:
+        axes[0].plot(epochs[:len(trainer.val_metrics_his)], trainer.val_metrics_his, lw=2.0, label='Val total')
+    axes[0].set_title('Total Loss')
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend(fontsize=9)
+
+    axes[1].plot(epochs[:len(trainer.train_recon_his)], trainer.train_recon_his, lw=2.0, label='Train recon')
+    axes[1].plot(epochs[:len(trainer.train_param_his)], trainer.train_param_his, lw=2.0, label='Train param')
+    if trainer.val_recon_his:
+        axes[1].plot(epochs[:len(trainer.val_recon_his)], trainer.val_recon_his, '--', lw=1.8, label='Val recon')
+    if trainer.val_param_his:
+        axes[1].plot(epochs[:len(trainer.val_param_his)], trainer.val_param_his, '--', lw=1.8, label='Val param')
+    axes[1].set_title('Recon vs Param')
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend(fontsize=9)
+
+    axes[2].plot(epochs[:len(trainer.train_eta_norm_his)], trainer.train_eta_norm_his, lw=2.0, color='tab:green')
+    axes[2].set_title('Mean |eta|')
+    axes[2].grid(True, alpha=0.3)
+    axes[2].set_xlabel('Epoch')
+
+    axes[3].plot(epochs[:len(trainer.train_eta_shift_his)], trainer.train_eta_shift_his, lw=2.0, color='tab:red')
+    axes[3].set_title('Mean eta shift')
+    axes[3].grid(True, alpha=0.3)
+    axes[3].set_xlabel('Epoch')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'training_diagnostics.png'), dpi=150)
+    plt.close()
+
+
+def plot_parameter_diagnostics(test_results, save_dir):
+    tids = sorted(test_results.keys())
+    true_alpha = np.array([test_results[tid]['alpha'] for tid in tids], dtype=float)
+    pred_alpha = np.array([test_results[tid]['pred_alpha'] for tid in tids], dtype=float)
+    true_r = np.array([test_results[tid]['r'] for tid in tids], dtype=float)
+    pred_r = np.array([test_results[tid]['pred_r'] for tid in tids], dtype=float)
+    err_alpha = np.array([test_results[tid]['err_alpha'] for tid in tids], dtype=float)
+    err_r = np.array([test_results[tid]['err_r'] for tid in tids], dtype=float)
+    bloch_mse = np.array([test_results[tid]['bloch_mse'] for tid in tids], dtype=float)
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+    axes = axes.ravel()
+
+    min_alpha = min(true_alpha.min(), pred_alpha.min())
+    max_alpha = max(true_alpha.max(), pred_alpha.max())
+    axes[0].scatter(true_alpha, pred_alpha, color='tab:blue')
+    axes[0].plot([min_alpha, max_alpha], [min_alpha, max_alpha], 'k--', lw=1)
+    axes[0].set_xlabel('True alpha')
+    axes[0].set_ylabel('Pred alpha')
+    axes[0].set_title('Alpha Calibration')
+    axes[0].grid(True, alpha=0.3)
+
+    min_r = min(true_r.min(), pred_r.min())
+    max_r = max(true_r.max(), pred_r.max())
+    axes[1].scatter(true_r, pred_r, color='tab:orange')
+    axes[1].plot([min_r, max_r], [min_r, max_r], 'k--', lw=1)
+    axes[1].set_xlabel('True r')
+    axes[1].set_ylabel('Pred r')
+    axes[1].set_title('r Calibration')
+    axes[1].grid(True, alpha=0.3)
+
+    axes[2].scatter(err_alpha, bloch_mse, color='tab:purple')
+    axes[2].set_xlabel('|alpha error|')
+    axes[2].set_ylabel('Bloch MSE')
+    axes[2].set_title('Alpha Error vs Bloch MSE')
+    axes[2].grid(True, alpha=0.3)
+
+    axes[3].scatter(err_r, bloch_mse, color='tab:green')
+    axes[3].set_xlabel('|r error|')
+    axes[3].set_ylabel('Bloch MSE')
+    axes[3].set_title('r Error vs Bloch MSE')
+    axes[3].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'parameter_diagnostics.png'), dpi=150)
+    plt.close()
+
+
+def plot_task_ranking(test_results, save_dir):
+    tids = sorted(test_results.keys())
+    labels = [f'T{tid}' for tid in tids]
+    bloch = np.array([test_results[tid]['bloch_mse'] for tid in tids], dtype=float)
+    err_alpha = np.array([test_results[tid]['err_alpha'] for tid in tids], dtype=float)
+    err_r = np.array([test_results[tid]['err_r'] for tid in tids], dtype=float)
+    mse_z = np.array([test_results[tid]['mse_z'] for tid in tids], dtype=float)
+
+    order = np.argsort(-bloch)
+    labels = [labels[idx] for idx in order]
+    bloch = bloch[order]
+    err_alpha = err_alpha[order]
+    err_r = err_r[order]
+    mse_z = mse_z[order]
+
+    fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
+    x = np.arange(len(labels))
+
+    axes[0].bar(x, bloch, color='tab:red', alpha=0.8)
+    axes[0].set_ylabel('Bloch MSE')
+    axes[0].set_title('Task ranking by Bloch MSE')
+    axes[0].grid(True, axis='y', alpha=0.3)
+
+    width = 0.25
+    axes[1].bar(x - width, err_alpha, width=width, label='|alpha error|', color='tab:blue')
+    axes[1].bar(x, err_r, width=width, label='|r error|', color='tab:orange')
+    axes[1].bar(x + width, mse_z, width=width, label='z MSE', color='tab:green')
+    axes[1].set_ylabel('Error')
+    axes[1].set_title('Per-task parameter and z errors')
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(labels, rotation=45)
+    axes[1].grid(True, axis='y', alpha=0.3)
+    axes[1].legend(fontsize=9)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'task_ranking.png'), dpi=150)
+    plt.close()
+
+
+def write_analysis_summary(test_results, save_dir):
+    tids = sorted(test_results.keys())
+    true_alpha = np.array([test_results[tid]['alpha'] for tid in tids], dtype=float)
+    pred_alpha = np.array([test_results[tid]['pred_alpha'] for tid in tids], dtype=float)
+    true_r = np.array([test_results[tid]['r'] for tid in tids], dtype=float)
+    pred_r = np.array([test_results[tid]['pred_r'] for tid in tids], dtype=float)
+    bloch = np.array([test_results[tid]['bloch_mse'] for tid in tids], dtype=float)
+    mse_z = np.array([test_results[tid]['mse_z'] for tid in tids], dtype=float)
+    err_alpha = np.array([test_results[tid]['err_alpha'] for tid in tids], dtype=float)
+    err_r = np.array([test_results[tid]['err_r'] for tid in tids], dtype=float)
+    eta_norm = np.array([
+        float(np.linalg.norm(np.asarray(test_results[tid].get('eta', []), dtype=float)))
+        for tid in tids
+    ], dtype=float)
+
+    worst_idx = int(np.argmax(bloch))
+    best_idx = int(np.argmin(bloch))
+    summary = {
+        "avg_bloch_mse": float(np.mean(bloch)),
+        "avg_mse_z": float(np.mean(mse_z)),
+        "avg_err_alpha": float(np.mean(err_alpha)),
+        "avg_err_r": float(np.mean(err_r)),
+        "true_alpha_range": [float(true_alpha.min()), float(true_alpha.max())],
+        "pred_alpha_range": [float(pred_alpha.min()), float(pred_alpha.max())],
+        "true_r_range": [float(true_r.min()), float(true_r.max())],
+        "pred_r_range": [float(pred_r.min()), float(pred_r.max())],
+        "eta_norm_range": [float(eta_norm.min()), float(eta_norm.max())],
+        "best_task_by_bloch_mse": {
+            "task": int(tids[best_idx]),
+            "bloch_mse": float(bloch[best_idx]),
+        },
+        "worst_task_by_bloch_mse": {
+            "task": int(tids[worst_idx]),
+            "bloch_mse": float(bloch[worst_idx]),
+        },
+    }
+    with open(os.path.join(save_dir, 'analysis_summary.json'), 'w', encoding='utf-8') as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+
 def plot_results(trainer, test_dataset, test_results, save_dir):
     os.makedirs(save_dir, exist_ok=True)
 
@@ -146,6 +314,10 @@ def plot_results(trainer, test_dataset, test_results, save_dir):
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, 'training_loss.png'), dpi=150)
     plt.close()
+    plot_training_diagnostics(trainer, save_dir)
+    plot_parameter_diagnostics(test_results, save_dir)
+    plot_task_ranking(test_results, save_dir)
+    write_analysis_summary(test_results, save_dir)
 
     # Bloch sphere for each test task
     for tid in test_dataset:
@@ -160,14 +332,27 @@ def plot_results(trainer, test_dataset, test_results, save_dir):
         pred_gamma = full_metrics['pred_gamma']
         loss = full_metrics['loss']
         bloch_mse = full_metrics['bloch_mse']
-        lam = full_metrics['lam']
+        mse_x = full_metrics.get('mse_x', 0.0)
+        mse_y = full_metrics.get('mse_y', 0.0)
+        mse_z = full_metrics.get('mse_z', 0.0)
+        mse_delta = full_metrics.get('mse_delta', 0.0)
+        mse_gamma = full_metrics.get('mse_gamma', 0.0)
+        eta = full_metrics.get('eta')
+        eta_norm = float(np.linalg.norm(eta)) if eta is not None else 0.0
+        task_A = td["alpha"] ** 2 * td["r"] ** 2 / (1.0 + td["r"] ** 2)
+        pred_A = full_metrics.get('pred_A', float('nan'))
+        pred_alpha = full_metrics.get('pred_alpha', float('nan'))
+        pred_r = full_metrics.get('pred_r', float('nan'))
 
         fig = plt.figure(figsize=(7, 7))
         ax = fig.add_subplot(111, projection='3d')
         ttl = (
-            f'Task {tid}: alpha={td["alpha"]:.2f}, r={td["r"]:.2f}, '
+            f'Task {tid}: alpha={td["alpha"]:.2f}->{pred_alpha:.2f}, '
+            f'r={td["r"]:.2f}->{pred_r:.2f}, '
+            f'A(diag)={task_A:.3f}->{pred_A:.3f}, '
             f'total={loss:.4f}, bloch={bloch_mse:.4f}, '
-            f'lam=[{lam[0]:.2f}, {lam[1]:.2f}]'
+            f'x/y/z={mse_x:.3f}/{mse_y:.3f}/{mse_z:.3f}, '
+            f'd/g(diag)={mse_delta:.3f}/{mse_gamma:.3f}, |eta|={eta_norm:.2f}'
         )
         draw_bloch_sphere(ax, true_traj, pred_traj, title=ttl)
         plt.tight_layout()
@@ -182,7 +367,7 @@ def plot_results(trainer, test_dataset, test_results, save_dir):
             pred_delta=pred_delta,
             true_gamma=true_gamma,
             pred_gamma=pred_gamma,
-            title=f'Task {tid} components',
+            title=f'Task {tid} components (delta/gamma are formula-derived diagnostics)',
             save_path=os.path.join(save_dir, f'xyz_task_{tid}.png'),
         )
 
