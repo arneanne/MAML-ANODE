@@ -1,19 +1,46 @@
-/mtk/              
-#过滤整个mtk文件夹
-*.zip               
-#过滤所有.zip文件
-/mtk/do.c        
-#过滤/mtk/do.c文件
+# Python 编译缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.py[cod]
+*$py.class
 
-results/*　　　 
-meta_aqnode_results/*
-__pycache__/*
+# IDE 配置
+.idea/
+.vscode/
+*.iml
+*.iws
+*.sublime-project
+*.sublime-workspace
 
-#忽略目录 fd1 下的全部内容
+# 调试文件
+.dbg/
 
-/fd1/*　　　　
-#忽略根目录下的 /fd1/ 目录的全部内容；
+# 实验结果、输出文件夹（核心忽略）
+results/
+meta_aqnode_results/
 
-!/fw/bin/
-!/fw/sf/             
-#不忽略 根目录下的 /fw/bin/ 和 /fw/sf/ 目录；
+# 日志、临时文件
+*.log
+*.out
+*.tmp
+*.temp
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 环境、虚拟环境
+venv/
+env/
+*.env
+
+# 模型权重（如需保存权重不提交仓库）
+*.pth
+*.ckpt
+*.pt
+*.safetensors
+
+# 文档临时草稿（可选，如果你不想上传调试md可放开）
+# debug-eta-stuck-zero.md
