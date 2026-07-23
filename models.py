@@ -7,11 +7,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-<<<<<<< HEAD
-from scipy.integrate import solve_ivp
-
-from data_gen import bloch_rhs, compute_delta_gamma
-=======
 
 
 def _tensor_to_numpy_safe(tensor, dtype=None):
@@ -83,7 +78,6 @@ def _integrate_tcl_bloch_scripted(
         out[idx + 1] = prev
 
     return out
->>>>>>> 2.0
 
 
 class AQNodeBase(nn.Module):
@@ -98,132 +92,6 @@ class AQNodeBase(nn.Module):
         measurement_strength=0.4,
     ):
         super().__init__()
-<<<<<<< HEAD
-        self.latent_dim = latent_dim
-        self.context_dim = context_dim
-        self.measurement_dim = measurement_dim
-        self.output_dim = 3
-        self.omega0 = omega0
-        self.measurement_strength = measurement_strength
-        self.alpha_min = 0.05
-        self.alpha_max = 1.0
-        self.r_min = 0.05
-        self.r_max = 1.0
-
-    def encode_initial(self, init_state, dY_seq):
-        """The clean physics-only model needs only the initial Bloch state."""
-        return init_state
-
-    def _compute_amplitude(self, alpha, r):
-        r_safe = torch.clamp(r, min=1e-6)
-        r2 = r_safe ** 2
-        return (alpha ** 2) * r2 / (1.0 + r2)
-
-    def _compute_tcl_generator_from_params(self, t_grid, alpha, r):
-        """Generate physically constrained Delta/gamma from task-level alpha and cutoff ratio r."""
-        t = t_grid.view(-1, 1)
-        alpha = alpha.view(1, -1)
-        r = r.view(1, -1)
-        r_safe = torch.clamp(r, min=1e-6)
-        amplitude = self._compute_amplitude(alpha, r_safe)
-
-        exp_term = torch.exp(-r_safe * self.omega0 * t)
-        cos_term = torch.cos(self.omega0 * t)
-        sin_term = torch.sin(self.omega0 * t)
-
-        gamma = amplitude * self.omega0 * (
-            1.0 - exp_term * cos_term - r_safe * sin_term
-        )
-        delta = 2.0 * amplitude * (
-            1.0 - exp_term * (cos_term - sin_term / r_safe)
-        )
-        return delta, gamma
-
-    def _decode_eta_to_task_params(self, eta):
-        """Treat eta itself as the task parameter body: eta = [raw_alpha, raw_r]."""
-        if eta.numel() != 2:
-            raise ValueError(f"eta must be 2D [raw_alpha, raw_r], got shape {tuple(eta.shape)}")
-        eta = eta.view(-1)
-        raw_alpha = eta[0]
-        raw_r = eta[1]
-        pred_alpha = self.alpha_min + (self.alpha_max - self.alpha_min) * torch.sigmoid(raw_alpha)
-        pred_r = self.r_min + (self.r_max - self.r_min) * torch.sigmoid(raw_r)
-        pred_A = self._compute_amplitude(pred_alpha, pred_r)
-        return {
-            "pred_A": pred_A,
-            "pred_alpha": pred_alpha,
-            "pred_r": pred_r,
-        }
-
-    def _project_to_bloch_ball(self, state):
-        """Project predicted Bloch vectors back to the physical unit ball."""
-        radius = torch.linalg.norm(state, dim=-1, keepdim=True)
-        return state / torch.clamp(radius, min=1.0)
-
-    def _integrate_tcl_bloch(self, init_state, delta_traj, gamma_traj, t_grid):
-        """Integrate the TCL Bloch equations using formula-derived Delta/gamma."""
-        bloch_states = [self._project_to_bloch_ball(init_state)]
-        half_measurement = self.measurement_strength / 2.0
-
-        for idx in range(1, t_grid.shape[0]):
-            dt = t_grid[idx] - t_grid[idx - 1]
-            prev = bloch_states[-1]
-            delta_prev = delta_traj[idx - 1]
-            gamma_prev = gamma_traj[idx - 1]
-
-            rhs_prev = torch.stack(
-                [
-                    -(delta_prev + half_measurement) * prev[:, 0] - self.omega0 * prev[:, 1],
-                    self.omega0 * prev[:, 0] - (delta_prev + half_measurement) * prev[:, 1],
-                    -2.0 * gamma_prev - 2.0 * delta_prev * prev[:, 2],
-                ],
-                dim=-1,
-            )
-            proposal = prev + dt * rhs_prev
-
-            delta_next = delta_traj[idx]
-            gamma_next = gamma_traj[idx]
-            rhs_next = torch.stack(
-                [
-                    -(delta_next + half_measurement) * proposal[:, 0] - self.omega0 * proposal[:, 1],
-                    self.omega0 * proposal[:, 0] - (delta_next + half_measurement) * proposal[:, 1],
-                    -2.0 * gamma_next - 2.0 * delta_next * proposal[:, 2],
-                ],
-                dim=-1,
-            )
-            next_state = prev + 0.5 * dt * (rhs_prev + rhs_next)
-            bloch_states.append(self._project_to_bloch_ball(next_state))
-
-        return torch.stack(bloch_states, dim=0)
-
-    def forward(
-        self,
-        init_state,
-        t_grid,
-        eta,
-        return_aux=False,
-    ):
-        t_grid = t_grid.to(init_state.device)
-        aux = self._decode_eta_to_task_params(eta)
-        pred_alpha = aux["pred_alpha"]
-        pred_r = aux["pred_r"]
-        base_delta, base_gamma = self._compute_tcl_generator_from_params(
-            t_grid,
-            pred_alpha.unsqueeze(0),
-            pred_r.unsqueeze(0),
-        )
-        batch_size = init_state.shape[0]
-        base_delta = base_delta.repeat(1, batch_size)
-        base_gamma = base_gamma.repeat(1, batch_size)
-        pred_delta = base_delta
-        pred_gamma = base_gamma
-        pred_bloch = self._integrate_tcl_bloch(init_state, pred_delta, pred_gamma, t_grid)
-        aux["pred_delta_traj"] = pred_delta
-        aux["pred_gamma_traj"] = pred_gamma
-        if return_aux:
-            return pred_bloch, aux
-        return pred_bloch
-=======
         self.latent_dim = latent_dim
         self.context_dim = context_dim
         self.measurement_dim = measurement_dim
@@ -430,7 +298,6 @@ class InnerAQNode(nn.Module):
         )
         clone.load_state_dict(self.state_dict())
         return clone
->>>>>>> 2.0
 
     def encode_initial(self, init_state, _dY_seq):
         return self.base.encode_initial(init_state, _dY_seq)
@@ -455,66 +322,6 @@ class InnerAQNode(nn.Module):
             "raw_dY": dY,
         }
 
-<<<<<<< HEAD
-class InnerAQNode(nn.Module):
-    """AQNode whose inner-loop variable eta is the task parameter body [raw_alpha, raw_r]."""
-
-    def __init__(
-        self,
-        latent_dim=64,
-        context_dim=8,
-        measurement_dim=50,
-        omega0=1.0,
-        measurement_strength=0.4,
-    ):
-        super().__init__()
-        if context_dim != 2:
-            raise ValueError(f"context_dim must be 2 for eta=[raw_alpha, raw_r], got {context_dim}")
-        self.base = AQNodeBase(
-            latent_dim,
-            context_dim,
-            measurement_dim,
-            omega0=omega0,
-            measurement_strength=measurement_strength,
-        )
-        self.eta_init = nn.Parameter(torch.zeros(2))
-        self.support_initializer = nn.Sequential(
-            nn.Linear(8, 16),
-            nn.Tanh(),
-            nn.Linear(16, 2),
-        )
-        self.latent_dim = latent_dim
-        self.context_dim = 2
-
-    def clone(self):
-        clone = InnerAQNode(
-            self.latent_dim,
-            self.context_dim,
-            self.base.measurement_dim,
-            omega0=self.base.omega0,
-            measurement_strength=self.base.measurement_strength,
-        )
-        clone.load_state_dict(self.state_dict())
-        return clone
-
-    def encode_initial(self, init_state, dY_seq):
-        return self.base.encode_initial(init_state, dY_seq)
-
-    def _summarize_support_batch(self, support_batch):
-        init_state = support_batch["init_state"]
-        dY = support_batch["dY"].squeeze(-1)
-        init_mean = init_state.mean(dim=0)
-        init_std = init_state.std(dim=0, unbiased=False)
-        dy_mean = dY.mean().unsqueeze(0)
-        dy_std = dY.std(unbiased=False).unsqueeze(0)
-        return torch.cat([init_mean, init_std, dy_mean, dy_std], dim=0)
-
-    def infer_eta_init_from_support(self, support_batch):
-        support_feat = self._summarize_support_batch(support_batch)
-        eta_bias = 0.1 * torch.tanh(self.support_initializer(support_feat))
-        return self.eta_init + eta_bias
-
-=======
     def _encode_initial_branch(self, raw_dY):
         prefix = raw_dY[:, :self.support_initial_window]
         if prefix.shape[1] < self.support_initial_window:
@@ -590,7 +397,6 @@ class InnerAQNode(nn.Module):
             return eta0_task, support_ctx
         return eta0_task
 
->>>>>>> 2.0
     def forward(
         self,
         init_state,
@@ -641,17 +447,12 @@ class MetaTrainer:
         w_x=1.0,
         w_y=1.0,
         w_z=1.5,
-<<<<<<< HEAD
-        w_alpha=1.0,
-        w_r=1.0,
-=======
         w_delta=0.7,
         w_gamma=1.2,
         w_alpha=1.0,
         w_r=1.0,
         w_alpha_frac=1.0,
         w_r_frac=1.0,
->>>>>>> 2.0
         w_dy=0.0,
         inner_steps=5,
         inner_lr=0.1,
@@ -659,11 +460,6 @@ class MetaTrainer:
         eta_reg_weight=1e-3,
         device="cuda:0",
         measurement_dim=None,
-<<<<<<< HEAD
-        resimulate_query=True,
-        omega0=1.0,
-        measurement_strength=0.4,
-=======
         omega0=1.0,
         measurement_strength=0.4,
         param_mae_weight=0.5,
@@ -681,7 +477,6 @@ class MetaTrainer:
         val_param_weight=1.0,
         val_ood_mse_weight=1.0,
         val_bloch_weight=0.25,
->>>>>>> 2.0
         w_a=None,
     ):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -689,26 +484,13 @@ class MetaTrainer:
         self.seq_len = seq_len
         self.batch_size = batch_size
         self.inner_steps = inner_steps
-<<<<<<< HEAD
-        self.inner_lr = inner_lr
-=======
         init_inner_lr = torch.full((2,), float(inner_lr), dtype=torch.float32, device=self.device)
         self.raw_inner_lr = nn.Parameter(torch.log(torch.expm1(init_inner_lr)))
->>>>>>> 2.0
         self.context_dim = context_dim
         self.eta_reg_weight = eta_reg_weight
         self.w_x = w_x
         self.w_y = w_y
         self.w_z = w_z
-<<<<<<< HEAD
-        self.w_alpha = w_alpha if w_a is None else w_a
-        self.w_r = w_r
-        self.w_dy = w_dy
-        self.measurement_dim = measurement_dim if measurement_dim is not None else seq_len
-        self.resimulate_query = resimulate_query
-        self.omega0 = omega0
-        self.measurement_strength = measurement_strength
-=======
         self.w_delta = w_delta
         self.w_gamma = w_gamma
         self.w_alpha = w_alpha if w_a is None else w_a
@@ -734,7 +516,7 @@ class MetaTrainer:
         self.val_param_weight = val_param_weight
         self.val_ood_mse_weight = val_ood_mse_weight
         self.val_bloch_weight = val_bloch_weight
->>>>>>> 2.0
+        self.resimulate_query = False
 
         self.meta_net = InnerAQNode(
             latent_dim,
@@ -760,10 +542,6 @@ class MetaTrainer:
         self.train_param_his = []
         self.train_eta_shift_his = []
         self.train_eta_norm_his = []
-<<<<<<< HEAD
-        self.val_recon_his = []
-        self.val_param_his = []
-=======
         self.inner_lr_alpha_his = []
         self.inner_lr_r_his = []
         self.val_recon_his = []
@@ -774,7 +552,6 @@ class MetaTrainer:
 
     def _current_inner_lr(self):
         return torch.nn.functional.softplus(self.raw_inner_lr) + 1e-6
->>>>>>> 2.0
 
     def _compute_recon_loss(self, model, pred, batch):
         return model.compute_loss(
@@ -790,23 +567,6 @@ class MetaTrainer:
             eta_ref = self.meta_net.eta_init
         return torch.mean((eta - eta_ref) ** 2)
 
-<<<<<<< HEAD
-    def _compute_total_loss(
-        self,
-        model,
-        pred,
-        batch,
-        eta=None,
-        eta_ref=None,
-        include_eta_reg=False,
-        aux=None,
-        include_param_loss=True,
-    ):
-        recon_loss = self._compute_recon_loss(model, pred, batch)
-        dy_loss = torch.tensor(0.0, device=self.device)
-        eta_reg = torch.tensor(0.0, device=self.device)
-        param_loss = torch.tensor(0.0, device=self.device)
-=======
     def _build_normalized_generator_shape_summary(self, batch, amplitude):
         eps = 1e-6
         delta = batch["delta"].mean(dim=1)
@@ -959,27 +719,10 @@ class MetaTrainer:
         )
         terms["amp"] = (aux["pred_A"] - target_A) ** 2
 
->>>>>>> 2.0
         if self.w_dy > 0:
             scale = torch.sqrt(batch["task_M"] * batch["task_zeta"])
             dy_hat = scale * pred[:, :, 2]
             dy_true = batch["dY"].squeeze(-1)
-<<<<<<< HEAD
-            dy_loss = self.w_dy * torch.mean((dy_hat - dy_true) ** 2)
-        if aux is not None:
-            if include_param_loss:
-                if self.w_alpha > 0:
-                    param_loss = param_loss + self.w_alpha * (aux["pred_alpha"] - batch["task_alpha"]) ** 2
-                if self.w_r > 0:
-                    param_loss = param_loss + self.w_r * (aux["pred_r"] - batch["task_r"]) ** 2
-        if include_eta_reg and eta is not None and self.eta_reg_weight > 0:
-            eta_reg = self.eta_reg_weight * self._compute_eta_reg(eta, eta_ref=eta_ref)
-        total_loss = recon_loss + dy_loss + param_loss + eta_reg
-        return total_loss, recon_loss.detach(), param_loss.detach(), eta_reg.detach()
-
-    def _build_batch(self, task_data, traj_idx, t_start=0, seq_len=None):
-        traj_idx = np.asarray(traj_idx, dtype=np.int64)
-=======
             terms["mse_dy"] = torch.mean((dy_hat - dy_true) ** 2)
         else:
             terms["mse_dy"] = zero
@@ -1048,7 +791,6 @@ class MetaTrainer:
             traj_idx = [int(traj_idx)]
         else:
             traj_idx = [int(idx) for idx in traj_idx]
->>>>>>> 2.0
         num_time = task_data["bloch"].shape[1]
         seq_len = num_time if seq_len is None else min(seq_len, num_time)
         t_start = max(0, min(int(t_start), max(num_time - seq_len, 0)))
@@ -1157,12 +899,6 @@ class MetaTrainer:
             if not (same_traj and same_window):
                 break
             query = self.sample_task_data(task_data)
-<<<<<<< HEAD
-        if self.resimulate_query:
-            support = self._resimulate_batch_from_init(task_data, support)
-            query = self._resimulate_batch_from_init(task_data, query)
-=======
->>>>>>> 2.0
         return support, query
 
     def _deterministic_support_query(self, task_data, seq_len=None):
@@ -1200,18 +936,6 @@ class MetaTrainer:
             None,
         ).detach()
 
-<<<<<<< HEAD
-        eta0_task = self.meta_net.infer_eta_init_from_support(support_batch)
-        adapted_eta = eta0_task
-        _, aux_init = self.meta_net(
-            init_state_inner,
-            support_batch["t_grid"],
-            eta=adapted_eta,
-            return_aux=True,
-        )
-
-        for step_idx in range(self.inner_steps):
-=======
         eta0_task, support_ctx = self.meta_net.infer_eta_init_from_support(
             support_batch,
             return_ctx=True,
@@ -1219,40 +943,23 @@ class MetaTrainer:
         adapted_eta = eta0_task
 
         for _ in range(self.inner_steps):
->>>>>>> 2.0
             pred, aux = self.meta_net(
                 init_state_inner,
                 support_batch["t_grid"],
                 eta=adapted_eta,
                 return_aux=True,
             )
-<<<<<<< HEAD
-            loss, _, _, _ = self._compute_total_loss(
-                self.meta_net,
-=======
             loss, _ = self.compute_inner_loss(
->>>>>>> 2.0
                 pred,
                 aux,
                 support_batch,
                 eta=adapted_eta,
                 eta_ref=eta0_task,
-<<<<<<< HEAD
-                include_eta_reg=True,
-                aux=aux,
-                include_param_loss=False,
-            )
-            eta_grad = torch.autograd.grad(loss, adapted_eta, retain_graph=False, create_graph=False)[0]
-            adapted_eta = adapted_eta - self.inner_lr * eta_grad
-
-        return adapted_eta, eta0_task
-=======
             )
             eta_grad = torch.autograd.grad(loss, adapted_eta, retain_graph=False, create_graph=False)[0]
             adapted_eta = adapted_eta - self._current_inner_lr() * eta_grad
 
         return adapted_eta, eta0_task, support_ctx
->>>>>>> 2.0
 
     def _clear_inner_loop_grads(self):
         self.meta_net.base.zero_grad()
@@ -1263,11 +970,7 @@ class MetaTrainer:
         support_batch, query_batch = self._sample_support_query(task_data)
         self.meta_net.train()
 
-<<<<<<< HEAD
-        adapted_eta, eta0_task = self._adapt_eta(support_batch)
-=======
         adapted_eta, eta0_task, support_ctx = self._adapt_eta(support_batch)
->>>>>>> 2.0
 
         init_state_query = self.meta_net.encode_initial(
             query_batch["init_state"],
@@ -1279,10 +982,6 @@ class MetaTrainer:
             eta=adapted_eta,
             return_aux=True,
         )
-<<<<<<< HEAD
-        meta_loss, recon_loss, param_loss, eta_reg = self._compute_total_loss(
-            self.meta_net,
-=======
         inner_loss, _ = self.compute_inner_loss(
             *self.meta_net(
                 self.meta_net.encode_initial(
@@ -1298,33 +997,11 @@ class MetaTrainer:
             eta_ref=eta0_task,
         )
         meta_loss, outer_terms = self.compute_outer_loss(
->>>>>>> 2.0
             pred_query,
             query_aux,
             query_batch,
             eta=adapted_eta,
             eta_ref=eta0_task,
-<<<<<<< HEAD
-            include_eta_reg=True,
-            aux=query_aux,
-        )
-
-        meta_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.meta_net.parameters(), max_norm=5.0)
-        self.optimizer.step()
-        eta_after = self.meta_net.eta_init.detach().clone().cpu().numpy()
-        eta_shift = float(torch.norm(adapted_eta.detach().cpu() - eta0_task.detach().cpu()).item())
-
-        return {
-            "loss": meta_loss.item(),
-            "recon_loss": float(recon_loss.item()),
-            "param_loss": float(param_loss.item()),
-            "eta_reg": float(eta_reg.item()),
-            "adapted_eta": adapted_eta.detach().cpu().numpy(),
-            "eta0_task": eta0_task.detach().cpu().numpy(),
-            "meta_eta": eta_after,
-            "eta_shift": eta_shift,
-=======
             support_batch=support_batch,
         )
 
@@ -1361,16 +1038,10 @@ class MetaTrainer:
             "support_task_embedding": support_ctx,
             "task_alpha": support_batch["task_alpha"],
             "task_r": support_batch["task_r"],
->>>>>>> 2.0
         }
 
     def _evaluate_batches(self, support_batch, query_batch):
         self.meta_net.eval()
-<<<<<<< HEAD
-        adapted_eta, eta0_task = self._adapt_eta(support_batch)
-
-        with torch.no_grad():
-=======
         adapted_eta, eta0_task, _ = self._adapt_eta(support_batch)
 
         with torch.no_grad():
@@ -1379,7 +1050,6 @@ class MetaTrainer:
                 return_details=True,
             )
             embed_stats = self.meta_net._summarize_traj_embeddings(traj_embed)
->>>>>>> 2.0
             init_state_query = self.meta_net.encode_initial(
                 query_batch["init_state"],
                 None,
@@ -1390,23 +1060,13 @@ class MetaTrainer:
                 eta=adapted_eta,
                 return_aux=True,
             )
-<<<<<<< HEAD
-            total_loss, recon_loss, param_loss, eta_reg = self._compute_total_loss(
-                self.meta_net,
-=======
             total_loss, outer_terms = self.compute_outer_loss(
->>>>>>> 2.0
                 pred,
                 query_aux,
                 query_batch,
                 eta=adapted_eta,
                 eta_ref=eta0_task,
-<<<<<<< HEAD
-                include_eta_reg=True,
-                aux=query_aux,
-=======
                 support_batch=support_batch,
->>>>>>> 2.0
             )
             bloch_mse = torch.mean((pred[:, :, :3] - query_batch["bloch"]) ** 2)
             mse_x = torch.mean((pred[:, :, 0] - query_batch["bloch"][:, :, 0]) ** 2)
@@ -1418,19 +1078,11 @@ class MetaTrainer:
             mse_gamma = torch.mean((pred_gamma - query_batch["gamma"]) ** 2)
             err_alpha = torch.abs(query_aux["pred_alpha"] - query_batch["task_alpha"])
             err_r = torch.abs(query_aux["pred_r"] - query_batch["task_r"])
-<<<<<<< HEAD
-=======
             max_axis_mse = torch.max(torch.stack([mse_x, mse_y, mse_z]))
->>>>>>> 2.0
 
         self.meta_net.train()
         return {
             "loss": float(total_loss.item()),
-<<<<<<< HEAD
-            "recon_loss": float(recon_loss.item()),
-            "param_loss": float(param_loss.item()),
-            "eta_reg": float(eta_reg.item()),
-=======
             "recon_loss": float(outer_terms["recon_loss"].item()),
             "hidden_param_loss": float(outer_terms["hidden_param_loss"].item()),
             "param_loss": float(outer_terms["param_loss"].item()),
@@ -1444,15 +1096,10 @@ class MetaTrainer:
             "dy_loss": float(outer_terms["mse_dy"].item()),
             "smooth_loss": float(outer_terms["smooth"].item()),
             "dist_loss": float(outer_terms["dist"].item()),
->>>>>>> 2.0
             "bloch_mse": float(bloch_mse.item()),
             "mse_x": float(mse_x.item()),
             "mse_y": float(mse_y.item()),
             "mse_z": float(mse_z.item()),
-<<<<<<< HEAD
-            "mse_delta": float(mse_delta.item()),
-            "mse_gamma": float(mse_gamma.item()),
-=======
             "max_axis_mse": float(max_axis_mse.item()),
             "mse_delta": float(mse_delta.item()),
             "mse_gamma": float(mse_gamma.item()),
@@ -1460,7 +1107,6 @@ class MetaTrainer:
             "mse_r": float(outer_terms["mse_r"].item()),
             "mse_alpha_frac": float(outer_terms["mse_alpha_frac"].item()),
             "mse_r_frac": float(outer_terms["mse_r_frac"].item()),
->>>>>>> 2.0
             "pred_A": float(query_aux["pred_A"].item()),
             "pred_alpha": float(query_aux["pred_alpha"].item()),
             "pred_r": float(query_aux["pred_r"].item()),
@@ -1470,10 +1116,6 @@ class MetaTrainer:
             "pred_delta": pred_delta,
             "pred_gamma": pred_gamma,
             "batch": query_batch,
-<<<<<<< HEAD
-            "eta": adapted_eta.detach().cpu().numpy(),
-            "eta0_task": eta0_task.detach().cpu().numpy(),
-=======
             "eta": _tensor_to_numpy_safe(adapted_eta, dtype=float),
             "eta0_task": _tensor_to_numpy_safe(eta0_task, dtype=float),
             "attention_weights": _tensor_to_numpy_safe(attention_weights, dtype=float),
@@ -1485,20 +1127,10 @@ class MetaTrainer:
             "traj_embed_norm_mean": embed_stats["traj_embed_norm_mean"],
             "traj_embed_norm_std": embed_stats["traj_embed_norm_std"],
             "support_traj_idx": support_batch["traj_idx"].copy(),
->>>>>>> 2.0
         }
 
     def train(self, num_epochs=200, tasks_per_epoch=5, val_tasks=None):
         ids = sorted(self.task_dataset.keys())
-<<<<<<< HEAD
-        for ep in range(num_epochs):
-            chosen = ids
-            ep_loss = 0.0
-            ep_recon = 0.0
-            ep_param = 0.0
-            all_eta_shift = []
-            all_eta_norm = []
-=======
         if not ids:
             raise ValueError("task_dataset must contain at least one training task")
         effective_tasks_per_epoch = len(ids) if tasks_per_epoch <= 0 else min(tasks_per_epoch, len(ids))
@@ -1524,7 +1156,6 @@ class MetaTrainer:
             epoch_task_alphas = []
             epoch_task_rs = []
             self.optimizer.zero_grad()
->>>>>>> 2.0
             for tid in chosen:
                 update_info = self.meta_update(self.task_dataset[tid])
                 epoch_meta_losses.append(update_info["meta_loss"])
@@ -1534,10 +1165,6 @@ class MetaTrainer:
                 ep_loss += update_info["loss"]
                 ep_recon += update_info["recon_loss"]
                 ep_param += update_info["param_loss"]
-<<<<<<< HEAD
-                all_eta_shift.append(update_info["eta_shift"])
-                all_eta_norm.append(float(np.linalg.norm(update_info["adapted_eta"])))
-=======
                 ep_param_mae += update_info["param_mae"]
                 ep_eta_reg += update_info["eta_reg"]
                 all_eta_shift.append(update_info["eta_shift"])
@@ -1546,16 +1173,12 @@ class MetaTrainer:
                 all_eta0_shift.append(
                     float(np.linalg.norm(update_info["eta0_task"] - update_info["meta_eta"]))
                 )
->>>>>>> 2.0
                 print(
                     f"Ep {ep:3d} T{tid}: query_loss={update_info['loss']:.6f} "
                     f"recon={update_info['recon_loss']:.6f} "
                     f"param={update_info['param_loss']:.6f} "
-<<<<<<< HEAD
-=======
                     f"param_mae={update_info['param_mae']:.6f} "
                     f"amp={update_info['amplitude_loss']:.6f} "
->>>>>>> 2.0
                     f"eta_reg={update_info['eta_reg']:.6f} "
                     f"|adapted_eta|={np.linalg.norm(update_info['adapted_eta']):.4f} "
                     f"|meta_eta|={np.linalg.norm(update_info['meta_eta']):.4f} "
@@ -1576,12 +1199,9 @@ class MetaTrainer:
             avg = ep_loss / len(chosen)
             avg_recon = ep_recon / len(chosen)
             avg_param = ep_param / len(chosen)
-<<<<<<< HEAD
-=======
             avg_param_mae = ep_param_mae / len(chosen)
             avg_eta_reg = ep_eta_reg / len(chosen)
             avg_contrastive = float(contrastive_loss.detach().item())
->>>>>>> 2.0
             self.metrics_his.append(avg)
             self.train_recon_his.append(avg_recon)
             self.train_param_his.append(avg_param)
@@ -1589,12 +1209,6 @@ class MetaTrainer:
 
             val_avg = None
             selection_score = None
-<<<<<<< HEAD
-            if val_tasks is not None:
-                val_loss = 0.0
-                val_recon = 0.0
-                val_param = 0.0
-=======
             val_param_mae_avg = None
             val_worst_axis_mse = None
             if val_tasks:
@@ -1603,32 +1217,18 @@ class MetaTrainer:
                 val_param = 0.0
                 val_param_mae = 0.0
                 worst_axis_values = []
->>>>>>> 2.0
                 for _, task_data in val_tasks.items():
                     support_batch, query_batch = self._deterministic_support_query(task_data)
                     metrics = self._evaluate_batches(support_batch, query_batch)
                     val_loss += metrics["loss"]
                     val_recon += metrics["recon_loss"]
                     val_param += metrics["param_loss"]
-<<<<<<< HEAD
-=======
                     val_param_mae += 0.5 * (metrics["err_alpha"] + metrics["err_r"])
                     worst_axis_values.append(metrics["max_axis_mse"])
->>>>>>> 2.0
 
                 val_avg = val_loss / len(val_tasks)
                 val_recon_avg = val_recon / len(val_tasks)
                 val_param_avg = val_param / len(val_tasks)
-<<<<<<< HEAD
-                # Select checkpoints by parameter identification first, with reconstruction as a tie-breaker.
-                selection_score = val_param_avg + 0.1 * val_recon_avg
-                self.val_metrics_his.append(val_avg)
-                self.val_recon_his.append(val_recon_avg)
-                self.val_param_his.append(val_param_avg)
-                self.selection_score_his.append(selection_score)
-                if selection_score < self.lowest_loss:
-                    self.best_net = copy.deepcopy(self.meta_net)
-=======
                 val_param_mae_avg = val_param_mae / len(val_tasks)
                 val_worst_axis_mse = max(worst_axis_values) if worst_axis_values else None
                 # Select checkpoints by parameter identification and OOD-like worst-axis reconstruction.
@@ -1646,7 +1246,6 @@ class MetaTrainer:
                 if selection_score < self.lowest_loss:
                     self.best_net = copy.deepcopy(self.meta_net)
                     self.best_raw_inner_lr = self.raw_inner_lr.detach().clone()
->>>>>>> 2.0
                     self.lowest_loss = selection_score
             else:
                 if avg < self.lowest_loss:
@@ -1656,16 +1255,6 @@ class MetaTrainer:
 
             val_str = f"  val={val_avg:.6f}" if val_avg is not None else ""
             select_str = f"  sel={selection_score:.6f}" if selection_score is not None else ""
-<<<<<<< HEAD
-            eta_shift_avg = float(np.mean(all_eta_shift)) if all_eta_shift else 0.0
-            eta_norm_avg = float(np.mean(all_eta_norm)) if all_eta_norm else float(torch.norm(self.meta_net.eta_init).item())
-            self.train_eta_shift_his.append(eta_shift_avg)
-            self.train_eta_norm_his.append(eta_norm_avg)
-            print(
-                f"  Avg query loss: {avg:.6f}{val_str}{select_str}  "
-                f"mean_eta_norm={eta_norm_avg:.4f}  "
-                f"mean_eta_shift={eta_shift_avg:.5f}"
-=======
             val_param_mae_str = (
                 f"  val_param_mae={val_param_mae_avg:.6f}"
                 if val_param_mae_avg is not None
@@ -1727,7 +1316,6 @@ class MetaTrainer:
                 f"mean_eta_shift={eta_shift_avg:.5f}  "
                 f"inner_lr=[{current_inner_lr[0]:.4f}, {current_inner_lr[1]:.4f}]  "
                 f"epoch_time={epoch_time_sec:.2f}s"
->>>>>>> 2.0
             )
 
     def evaluate(self, task_data):
@@ -1762,15 +1350,6 @@ class MetaTrainer:
             support_batch = self._resimulate_batch_from_init(task_data, support_batch)
             query_batch = self._resimulate_batch_from_init(task_data, query_batch)
         metrics = self._evaluate_batches(support_batch, query_batch)
-<<<<<<< HEAD
-        pred_full = metrics["pred"][:, 0, :].detach().cpu().numpy()
-        true_traj = query_batch["bloch"][:, 0, :3].detach().cpu().numpy()
-        true_delta = query_batch["delta"][:, 0].detach().cpu().numpy()
-        true_gamma = query_batch["gamma"][:, 0].detach().cpu().numpy()
-        pred_traj = pred_full.copy()
-        pred_delta = metrics["pred_delta"][:, 0].detach().cpu().numpy()
-        pred_gamma = metrics["pred_gamma"][:, 0].detach().cpu().numpy()
-=======
         pred_full = _tensor_to_numpy_safe(metrics["pred"][:, 0, :], dtype=float)
         true_traj = _tensor_to_numpy_safe(query_batch["bloch"][:, 0, :3], dtype=float)
         true_delta = _tensor_to_numpy_safe(query_batch["delta"][:, 0], dtype=float)
@@ -1778,7 +1357,6 @@ class MetaTrainer:
         pred_traj = pred_full.copy()
         pred_delta = _tensor_to_numpy_safe(metrics["pred_delta"][:, 0], dtype=float)
         pred_gamma = _tensor_to_numpy_safe(metrics["pred_gamma"][:, 0], dtype=float)
->>>>>>> 2.0
 
         return {
             "loss": metrics["loss"],
@@ -1786,11 +1364,6 @@ class MetaTrainer:
             "mse_x": metrics["mse_x"],
             "mse_y": metrics["mse_y"],
             "mse_z": metrics["mse_z"],
-<<<<<<< HEAD
-            "mse_delta": metrics["mse_delta"],
-            "mse_gamma": metrics["mse_gamma"],
-            "param_loss": metrics["param_loss"],
-=======
             "max_axis_mse": metrics["max_axis_mse"],
             "mse_delta": metrics["mse_delta"],
             "mse_gamma": metrics["mse_gamma"],
@@ -1799,18 +1372,14 @@ class MetaTrainer:
             "amplitude_loss": metrics["amplitude_loss"],
             "support_amp_aux_loss": metrics["support_amp_aux_loss"],
             "support_shape_aux_loss": metrics["support_shape_aux_loss"],
->>>>>>> 2.0
             "pred_A": metrics["pred_A"],
             "pred_alpha": metrics["pred_alpha"],
             "pred_r": metrics["pred_r"],
             "err_alpha": metrics["err_alpha"],
             "err_r": metrics["err_r"],
             "eta": metrics["eta"],
-<<<<<<< HEAD
-=======
             "attention_weights": metrics["attention_weights"],
             "support_traj_idx": metrics["support_traj_idx"],
->>>>>>> 2.0
             "true_traj": true_traj,
             "pred_traj": pred_traj,
             "true_delta": true_delta,
@@ -1829,11 +1398,6 @@ class MetaTrainer:
                 "mse_x": metrics["mse_x"],
                 "mse_y": metrics["mse_y"],
                 "mse_z": metrics["mse_z"],
-<<<<<<< HEAD
-                "mse_delta": metrics["mse_delta"],
-                "mse_gamma": metrics["mse_gamma"],
-                "param_loss": metrics["param_loss"],
-=======
                 "max_axis_mse": metrics["max_axis_mse"],
                 "mse_delta": metrics["mse_delta"],
                 "mse_gamma": metrics["mse_gamma"],
@@ -1842,7 +1406,6 @@ class MetaTrainer:
                 "amplitude_loss": metrics["amplitude_loss"],
                 "support_amp_aux_loss": metrics["support_amp_aux_loss"],
                 "support_shape_aux_loss": metrics["support_shape_aux_loss"],
->>>>>>> 2.0
                 "A": float(self.meta_net.base._compute_amplitude(
                     torch.tensor(float(task_data["alpha"])),
                     torch.tensor(float(task_data["r"])),
@@ -1859,14 +1422,11 @@ class MetaTrainer:
                 "err_alpha": metrics["err_alpha"],
                 "err_r": metrics["err_r"],
                 "eta": metrics["eta"],
-<<<<<<< HEAD
-=======
                 "attention_weights": metrics["attention_weights"],
                 "attention_logit_std": metrics["attention_logit_std"],
                 "traj_embed_pairwise_cos_mean": metrics["traj_embed_pairwise_cos_mean"],
                 "traj_embed_norm_mean": metrics["traj_embed_norm_mean"],
                 "traj_embed_norm_std": metrics["traj_embed_norm_std"],
                 "support_traj_idx": metrics["support_traj_idx"],
->>>>>>> 2.0
             }
         return results

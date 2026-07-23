@@ -266,15 +266,11 @@ def write_analysis_summary(test_results, save_dir):
     true_r = np.array([test_results[tid]['r'] for tid in tids], dtype=float)
     pred_r = np.array([test_results[tid]['pred_r'] for tid in tids], dtype=float)
     bloch = np.array([test_results[tid]['bloch_mse'] for tid in tids], dtype=float)
-<<<<<<< HEAD
-    mse_z = np.array([test_results[tid]['mse_z'] for tid in tids], dtype=float)
-=======
     mse_x = np.array([test_results[tid].get('mse_x', np.nan) for tid in tids], dtype=float)
     mse_y = np.array([test_results[tid].get('mse_y', np.nan) for tid in tids], dtype=float)
     mse_z = np.array([test_results[tid]['mse_z'] for tid in tids], dtype=float)
     mse_delta = np.array([test_results[tid].get('mse_delta', np.nan) for tid in tids], dtype=float)
     mse_gamma = np.array([test_results[tid].get('mse_gamma', np.nan) for tid in tids], dtype=float)
->>>>>>> 2.0
     err_alpha = np.array([test_results[tid]['err_alpha'] for tid in tids], dtype=float)
     err_r = np.array([test_results[tid]['err_r'] for tid in tids], dtype=float)
     eta_norm = np.array([
@@ -286,15 +282,11 @@ def write_analysis_summary(test_results, save_dir):
     best_idx = int(np.argmin(bloch))
     summary = {
         "avg_bloch_mse": float(np.mean(bloch)),
-<<<<<<< HEAD
-        "avg_mse_z": float(np.mean(mse_z)),
-=======
         "avg_mse_x": float(np.nanmean(mse_x)),
         "avg_mse_y": float(np.nanmean(mse_y)),
         "avg_mse_z": float(np.mean(mse_z)),
         "avg_mse_delta": float(np.nanmean(mse_delta)),
         "avg_mse_gamma": float(np.nanmean(mse_gamma)),
->>>>>>> 2.0
         "avg_err_alpha": float(np.mean(err_alpha)),
         "avg_err_r": float(np.mean(err_r)),
         "true_alpha_range": [float(true_alpha.min()), float(true_alpha.max())],
@@ -315,8 +307,6 @@ def write_analysis_summary(test_results, save_dir):
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
 
-<<<<<<< HEAD
-=======
 def plot_attention_diagnostics(test_results, save_dir):
     tids = sorted(test_results.keys())
     if not tids:
@@ -353,7 +343,6 @@ def plot_attention_diagnostics(test_results, save_dir):
     return out_path
 
 
->>>>>>> 2.0
 def plot_results(trainer, test_dataset, test_results, save_dir):
     os.makedirs(save_dir, exist_ok=True)
 
@@ -372,10 +361,7 @@ def plot_results(trainer, test_dataset, test_results, save_dir):
     plot_training_diagnostics(trainer, save_dir)
     plot_parameter_diagnostics(test_results, save_dir)
     plot_task_ranking(test_results, save_dir)
-<<<<<<< HEAD
-=======
     plot_attention_diagnostics(test_results, save_dir)
->>>>>>> 2.0
     write_analysis_summary(test_results, save_dir)
 
     # Bloch sphere for each test task

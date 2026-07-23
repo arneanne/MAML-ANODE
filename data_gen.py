@@ -155,32 +155,6 @@ def compute_delta_gamma(t, alpha, r, omega0=1.0, kBT=10.0):
     gamma = torch.nan_to_num(gamma, nan=0.0, posinf=0.0, neginf=0.0)
 
     return delta.float(), gamma.float()
-<<<<<<< HEAD
-
-
-def bloch_rhs(t, y, alpha, r, omega0, M, kBT):
-    """RHS of Bloch equations (Eq.5).
-
-    Args:
-        t: current time (scalar)
-        y: [x, y, z] Bloch vector
-
-    Returns:
-        [dx/dt, dy/dt, dz/dt]
-    """
-    x, y_, z = y
-    t_tensor = torch.tensor([t], dtype=torch.float64)
-    Delta, gamma = compute_delta_gamma(t_tensor, alpha, r, omega0, kBT)
-    D = Delta.item()
-    G = gamma.item()
-
-    dx = -(D + M / 2.0) * x - omega0 * y_
-    dy = omega0 * x - (D + M / 2.0) * y_
-    dz = -2.0 * G - 2.0 * D * z
-
-    return [dx, dy, dz]
-=======
->>>>>>> 2.0
 
 
 def weak_measurement(y, M=0.4, zeta=0.9):
@@ -253,19 +227,11 @@ def generate_task_data(alpha, r, num_traj=200, T=10.0, dt=0.01,
         'M': M,
         'zeta': zeta,
         'kBT': kBT,
-<<<<<<< HEAD
-        'bloch': torch.from_numpy(bloch_traj),
-        'delta': torch.from_numpy(Delta_np[None, :].repeat(num_traj, axis=0).astype(np.float32)),
-        'gamma': torch.from_numpy(Gamma_np[None, :].repeat(num_traj, axis=0).astype(np.float32)),
-        'dY': torch.from_numpy(meas_traj),
-        't': torch.from_numpy(t_grid.astype(np.float32)),
-=======
         'bloch': bloch_bt.cpu(),
         'delta': delta_traj.transpose(0, 1).contiguous().cpu(),
         'gamma': gamma_traj.transpose(0, 1).contiguous().cpu(),
         'dY': meas_traj.cpu(),
         't': t_grid.cpu(),
->>>>>>> 2.0
     }
 
 
