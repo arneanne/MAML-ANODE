@@ -1,14 +1,101 @@
 # data_gen.py - synthetic quantum trajectory data for Meta-AQNODE
-import os, tempfile, torch, numpy as np, random
-from scipy.integrate import solve_ivp
-from torchdiffeq import odeint
-
 import os
 import tempfile
-import torch
+
 import numpy as np
-from scipy.integrate import solve_ivp
-import random
+import torch
+
+
+@torch.jit.script
+def _project_to_bloch_ball_tensor(state: torch.Tensor) -> torch.Tensor:
+    radius = torch.linalg.norm(state, dim=-1, keepdim=True)
+    return state / torch.clamp_min(radius, 1.0)
+
+
+@torch.jit.script
+def _integrate_tcl_bloch_scripted(
+    init_state: torch.Tensor,
+    delta_traj: torch.Tensor,
+    gamma_traj: torch.Tensor,
+    t_grid: torch.Tensor,
+    omega0: float,
+    measurement_strength: float,
+) -> torch.Tensor:
+    num_steps = t_grid.size(0)
+    batch_size = init_state.size(0)
+    out = torch.empty((num_steps, batch_size, 3), dtype=init_state.dtype, device=init_state.device)
+    prev = _project_to_bloch_ball_tensor(init_state)
+    out[0] = prev
+    if num_steps <= 1:
+        return out
+
+    half_measurement = measurement_strength / 2.0
+    dt_all = t_grid[1:] - t_grid[:-1]
+
+    for idx in range(num_steps - 1):
+        dt = dt_all[idx]
+
+        delta_prev = delta_traj[idx]
+        gamma_prev = gamma_traj[idx]
+        coeff_prev = delta_prev + half_measurement
+        x_prev = prev[:, 0]
+        y_prev = prev[:, 1]
+        z_prev = prev[:, 2]
+
+        rhs_prev_x = -coeff_prev * x_prev - omega0 * y_prev
+        rhs_prev_y = omega0 * x_prev - coeff_prev * y_prev
+        rhs_prev_z = -2.0 * gamma_prev - 2.0 * delta_prev * z_prev
+
+        proposal_x = x_prev + dt * rhs_prev_x
+        proposal_y = y_prev + dt * rhs_prev_y
+        proposal_z = z_prev + dt * rhs_prev_z
+
+        delta_next = delta_traj[idx + 1]
+        gamma_next = gamma_traj[idx + 1]
+        coeff_next = delta_next + half_measurement
+
+        rhs_next_x = -coeff_next * proposal_x - omega0 * proposal_y
+        rhs_next_y = omega0 * proposal_x - coeff_next * proposal_y
+        rhs_next_z = -2.0 * gamma_next - 2.0 * delta_next * proposal_z
+
+        next_x = x_prev + 0.5 * dt * (rhs_prev_x + rhs_next_x)
+        next_y = y_prev + 0.5 * dt * (rhs_prev_y + rhs_next_y)
+        next_z = z_prev + 0.5 * dt * (rhs_prev_z + rhs_next_z)
+
+        prev = _project_to_bloch_ball_tensor(
+            torch.stack((next_x, next_y, next_z), dim=-1)
+        )
+        out[idx + 1] = prev
+
+    return out
+
+def delta_fn(t, alpha, r, omega_0):
+    """Stable scalar/numpy Delta(t) definition."""
+    exp_term = np.exp(-r * omega_0 * t)
+    cos_term = np.cos(omega_0 * t)
+    sin_term = np.sin(omega_0 * t)
+
+    delta = 2 * alpha ** 2 * r ** 2 / (1 + r ** 2) * (
+        1 - exp_term * (cos_term - sin_term / r)
+    )
+    if np.isnan(delta) or np.isinf(delta):
+        return 0.0
+    return delta
+
+
+def gamma_fn(t, alpha, r, omega_0):
+    """Stable scalar/numpy gamma(t) definition."""
+    exp_term = np.exp(-r * omega_0 * t)
+    cos_term = np.cos(omega_0 * t)
+    sin_term = np.sin(omega_0 * t)
+
+    gamma = alpha ** 2 * omega_0 * r ** 2 / (1 + r ** 2) * (
+        1 - exp_term * cos_term - r * sin_term
+    )
+    if np.isnan(gamma) or np.isinf(gamma):
+        return 0.0
+    return gamma
+
 
 def delta_fn(t, alpha, r, omega_0):
     """Stable scalar/numpy Delta(t) definition."""
@@ -68,6 +155,7 @@ def compute_delta_gamma(t, alpha, r, omega0=1.0, kBT=10.0):
     gamma = torch.nan_to_num(gamma, nan=0.0, posinf=0.0, neginf=0.0)
 
     return delta.float(), gamma.float()
+<<<<<<< HEAD
 
 
 def bloch_rhs(t, y, alpha, r, omega0, M, kBT):
@@ -91,6 +179,8 @@ def bloch_rhs(t, y, alpha, r, omega0, M, kBT):
     dz = -2.0 * G - 2.0 * D * z
 
     return [dx, dy, dz]
+=======
+>>>>>>> 2.0
 
 
 def weak_measurement(y, M=0.4, zeta=0.9):
@@ -105,59 +195,56 @@ def weak_measurement(y, M=0.4, zeta=0.9):
 
 
 def generate_task_data(alpha, r, num_traj=200, T=10.0, dt=0.01,
-                       omega0=1.0, M=0.4, zeta=0.9, kBT=10.0, seed=None):
+                       omega0=1.0, M=0.4, zeta=0.9, kBT=10.0, seed=None, device=None):
     """Generate multiple trajectories for one (alpha, r) task.
 
     Each trajectory:
       - Random initial Bloch vector
-      - Integrate Bloch Eq.5 with RK45
+      - Batch integrate Bloch Eq.5 with a scripted tensor solver
       - Compute weak measurement Eq.7
       - Pre-compute analytical Delta(t), gamma(t) (Eq.2-3)
 
     Returns:
         dict with keys: bloch, delta, gamma, dY, t, alpha, r
     """
+    target_device = torch.device(device) if device is not None else torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
     if seed is not None:
         np.random.seed(seed)
 
-    t_grid = np.arange(0, T, dt)
-    N = len(t_grid)
+    t_grid = torch.arange(0, T, dt, dtype=torch.float32, device=target_device)
+    num_steps = int(t_grid.numel())
 
-    # Pre-compute Delta(t), gamma(t) (shared across all trajectories)
-    t_tensor = torch.tensor(t_grid, dtype=torch.float64)
-    Delta_full, Gamma_full = compute_delta_gamma(t_tensor, alpha, r, omega0, kBT)
-    Delta_np = Delta_full.numpy()
-    Gamma_np = Gamma_full.numpy()
-
-    bloch_traj = np.zeros((num_traj, N, 3), dtype=np.float32)
-    meas_traj = np.zeros((num_traj, N), dtype=np.float32)
-
-    for i in range(num_traj):
-# ========== 初始态生成 ==========
-        x0 = random.uniform(-0.8, 0.8)
-        y0 = random.uniform(-0.8, 0.8)
-        z0 = random.uniform(-1.0, 1.0)
-
-        xyz = torch.tensor([x0, y0, z0])
-        norm = torch.norm(xyz)
-        if norm > 1.0:
-            xyz = xyz / norm  # 投影到布洛赫球面
-        x0, y0, z0 = xyz.tolist()
-        y0 = [x0, y0, z0]
-    # ======================================
-
-        sol = solve_ivp(
-            bloch_rhs, [0, T], y0,
-            t_eval=t_grid,
-            args=(alpha, r, omega0, M, kBT),
-            method='RK45',
-            rtol=1e-8, atol=1e-10,
+    # Delta/gamma are shared across all trajectories of one task.
+    delta_full, gamma_full = compute_delta_gamma(
+        t_grid.to(dtype=torch.float64), alpha, r, omega0, kBT
     )
+    delta_full = delta_full.to(device=target_device, dtype=torch.float32)
+    gamma_full = gamma_full.to(device=target_device, dtype=torch.float32)
 
+    generator = torch.Generator(device=target_device)
+    if seed is not None:
+        generator.manual_seed(seed)
 
+    init_state = torch.empty((num_traj, 3), dtype=torch.float32, device=target_device)
+    init_state[:, 0].uniform_(-0.8, 0.8, generator=generator)
+    init_state[:, 1].uniform_(-0.8, 0.8, generator=generator)
+    init_state[:, 2].uniform_(-1.0, 1.0, generator=generator)
+    init_state = _project_to_bloch_ball_tensor(init_state)
 
-        bloch_traj[i] = sol.y.T.astype(np.float32)
-        meas_traj[i] = np.sqrt(M * zeta) * bloch_traj[i, :, 2]
+    delta_traj = delta_full.unsqueeze(1).expand(num_steps, num_traj)
+    gamma_traj = gamma_full.unsqueeze(1).expand(num_steps, num_traj)
+    bloch_traj = _integrate_tcl_bloch_scripted(
+        init_state=init_state,
+        delta_traj=delta_traj,
+        gamma_traj=gamma_traj,
+        t_grid=t_grid,
+        omega0=float(omega0),
+        measurement_strength=float(M),
+    )
+    bloch_bt = bloch_traj.permute(1, 0, 2).contiguous()
+    meas_traj = (float(np.sqrt(M * zeta)) * bloch_bt[:, :, 2]).contiguous()
 
     return {
         'alpha': alpha,
@@ -166,11 +253,19 @@ def generate_task_data(alpha, r, num_traj=200, T=10.0, dt=0.01,
         'M': M,
         'zeta': zeta,
         'kBT': kBT,
+<<<<<<< HEAD
         'bloch': torch.from_numpy(bloch_traj),
         'delta': torch.from_numpy(Delta_np[None, :].repeat(num_traj, axis=0).astype(np.float32)),
         'gamma': torch.from_numpy(Gamma_np[None, :].repeat(num_traj, axis=0).astype(np.float32)),
         'dY': torch.from_numpy(meas_traj),
         't': torch.from_numpy(t_grid.astype(np.float32)),
+=======
+        'bloch': bloch_bt.cpu(),
+        'delta': delta_traj.transpose(0, 1).contiguous().cpu(),
+        'gamma': gamma_traj.transpose(0, 1).contiguous().cpu(),
+        'dY': meas_traj.cpu(),
+        't': t_grid.cpu(),
+>>>>>>> 2.0
     }
 
 
@@ -236,14 +331,3 @@ if __name__ == '__main__':
     plt.close()
     print(f"Saved plot to {save_path}")
     print("All checks passed!")
-
-
-# models.py — Meta-AQNODE: MAML (model-agnostic meta-learning)
-
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import numpy as np
-import copy
-from bisect import bisect_left
-from torchdiffeq import odeint as odeint_orig
