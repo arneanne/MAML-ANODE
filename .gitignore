@@ -42,5 +42,15 @@ env/
 *.pt
 *.safetensors
 
+.trae/
+dy_viz_band_demo/
+dy_viz_train_sweeps/
+exported_tasks/
+exported_test_tasks/
+run_analysis/
+test_results/
+__pycache__/
+results/
+meta_aqnode_results/
 # 文档临时草稿（可选，如果你不想上传调试md可放开）
 # debug-eta-stuck-zero.md
